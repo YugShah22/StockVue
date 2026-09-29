@@ -15,10 +15,10 @@ class Exchange:
 
     def __post_init__(self) -> None:
         self.name = self.name.strip()
-        self.country = self.country.strip().upper()
+        self.country = self.country.strip()
 
         if not self.name:
-            raise ValueError("Exchange name cannot be empty.")
+            raise ValueError("Exchange name cannot be empty")
 
         if not self.country:
-            raise ValueError("Exchange country cannot be empty.")
+            raise ValueError("Exchange country cannot be empty")
