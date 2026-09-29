@@ -1,0 +1,74 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.env
+!.env.example
+
+# pytest
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# mypy
+.mypy_cache/
+
+# ruff
+.ruff_cache/
+
+# pyproject build
+*.dist-info/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Docker
+docker/postgres_data/
+docker/redis_data/
+
+# Model artifacts (Phase 5+)
+*.pkl
+*.pt
+*.pth
+*.h5
+*.onnx
+models/artifacts/
+
+# Data (never commit raw or processed financial data)
+data/
+*.csv
+*.parquet
+*.feather
+
+# Logs
+*.log
+logs/
+
+# Secrets (belt-and-suspenders)
+*.pem
+*.key
+*.p12
+secrets/
