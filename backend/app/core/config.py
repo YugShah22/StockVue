@@ -61,9 +61,7 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # Database
     # ------------------------------------------------------------------
-    database_url: str = (
-        "postgresql+psycopg://stockvue:stockvue@localhost:5432/stockvue"
-    )
+    database_url: str = "postgresql+psycopg://stockvue:stockvue@localhost:5432/stockvue"
 
     @property
     def is_development(self) -> bool:

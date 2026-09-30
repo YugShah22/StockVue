@@ -13,7 +13,7 @@ import zoneinfo
 # ---------------------------------------------------------------------------
 
 UTC = zoneinfo.ZoneInfo("UTC")
-IST = zoneinfo.ZoneInfo("Asia/Kolkata")   # Indian Standard Time (NSE / BSE)
+IST = zoneinfo.ZoneInfo("Asia/Kolkata")  # Indian Standard Time (NSE / BSE)
 
 # ---------------------------------------------------------------------------
 # API
@@ -47,6 +47,6 @@ STRENGTH_LIMITED = "LIMITED"
 # Numeric defaults
 # ---------------------------------------------------------------------------
 
-DEFAULT_LOOKBACK_DAYS: int = 252       # ~1 trading year
-DEFAULT_ROLLING_WINDOW: int = 20       # ~1 trading month
-MAX_POSITION_WEIGHT: float = 0.20      # 20% max single position (default constraint)
+DEFAULT_LOOKBACK_DAYS: int = 252  # ~1 trading year
+DEFAULT_ROLLING_WINDOW: int = 20  # ~1 trading month
+MAX_POSITION_WEIGHT: float = 0.20  # 20% max single position (default constraint)

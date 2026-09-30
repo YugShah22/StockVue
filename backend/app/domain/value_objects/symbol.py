@@ -11,7 +11,7 @@ class Symbol:
         if not normalized:
             raise ValueError("Symbol cannot be empty.")
 
-        object.__setattr__(self,"value",normalized)
+        object.__setattr__(self, "value", normalized)
 
     def __str__(self) -> str:
         return self.value
