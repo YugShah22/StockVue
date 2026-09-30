@@ -58,6 +58,13 @@ class Settings(BaseSettings):
     HOST: str = "0.0.0.0"
     PORT: int = 8000
 
+    # ------------------------------------------------------------------
+    # Database
+    # ------------------------------------------------------------------
+    database_url: str = (
+        "postgresql+psycopg://stockvue:stockvue@localhost:5432/stockvue"
+    )
+
     @property
     def is_development(self) -> bool:
         return self.ENVIRONMENT == Environment.DEVELOPMENT
