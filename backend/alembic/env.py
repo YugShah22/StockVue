@@ -5,6 +5,8 @@ from sqlalchemy import engine_from_config, pool
 
 from app.core.config import settings
 from app.infrastructure.database.base import Base
+import app.infrastructure.database.registry  # noqa: F401 — registers all ORM models
+
 
 config = context.config
 

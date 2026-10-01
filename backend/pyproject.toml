@@ -17,8 +17,12 @@ dependencies = [
     "uvicorn[standard]>=0.32.0",
     "pydantic>=2.9.0",
     "pydantic-settings>=2.6.0",
+    "sqlalchemy>=2.0.0",
+    "alembic>=1.13.0",
+    "psycopg[binary]>=3.1.0",     # psycopg3 driver (postgresql+psycopg://)
     "tzdata>=2024.1",              # Windows: IANA timezone data for zoneinfo
 ]
+
 
 [project.optional-dependencies]
 dev = [
@@ -51,6 +55,16 @@ ignore = [
     "E501",  # line-too-long — handled by formatter
 ]
 
+[tool.ruff.lint.per-file-ignores]
+# registry.py imports ORM models purely for SQLAlchemy mapper side-effects.
+# Nothing references them by name, so F401 would flag them as unused.
+# They MUST stay — removing them breaks Alembic autogenerate and create_all().
+"app/infrastructure/database/registry.py" = ["F401"]
+# These files import registry as a side-effect (no name referenced).
+"alembic/env.py" = ["E402", "F401"]
+"tests/integration/conftest.py" = ["F401"]
+
+
 [tool.ruff.lint.isort]
 known-first-party = ["app"]
 
@@ -70,6 +84,7 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]

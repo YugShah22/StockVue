@@ -1,17 +1,6 @@
-from app.infrastructure.database.models.company import CompanyModel
-from app.infrastructure.database.models.exchange import ExchangeModel
-from app.infrastructure.database.models.instrument import InstrumentModel
-from app.infrastructure.database.models.instrument_history import (
-    InstrumentHistoryModel,
-)
-from app.infrastructure.database.models.market_holiday import (
-    MarketHolidayModel,
-)
-
-__all__ = [
-    "CompanyModel",
-    "ExchangeModel",
-    "InstrumentModel",
-    "InstrumentHistoryModel",
-    "MarketHolidayModel",
-]
+# Models are registered with SQLAlchemy via app.infrastructure.database.base.
+# Do NOT import models here — it creates a circular import:
+#   models/__init__.py → models/company.py → base.py → models/company.py (💥)
+#
+# Import individual models directly from their modules when needed, e.g.:
+#   from app.infrastructure.database.models.company import CompanyModel

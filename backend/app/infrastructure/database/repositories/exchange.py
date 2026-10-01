@@ -25,7 +25,7 @@ class PostgresExchangeRepository(ExchangeRepository):
             code=ExchangeCode(model.code),
             name=model.name,
             country=model.country,
-            timezone=__import__("zoneinfo").ZoneInfo(model.timezone),
+            timezone=ZoneInfo(model.timezone),
         )
 
     def get_by_code(self, code: ExchangeCode) -> Exchange | None:

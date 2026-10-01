@@ -1,7 +1,7 @@
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from sqlalchemy.orm import Session
-from zoneinfo import ZoneInfo
 
 from app.domain.entities.company import Company
 from app.domain.entities.exchange import Exchange
@@ -11,8 +11,6 @@ from app.domain.enums.instrument_status import InstrumentStatus
 from app.domain.value_objects.exchange_code import ExchangeCode
 from app.domain.value_objects.isin import ISIN
 from app.domain.value_objects.symbol import Symbol
-from app.infrastructure.database.models.company import CompanyModel
-from app.infrastructure.database.models.exchange import ExchangeModel
 from app.infrastructure.database.repositories.company import (
     PostgresCompanyRepository,
 )
