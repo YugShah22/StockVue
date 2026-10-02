@@ -21,6 +21,7 @@ dependencies = [
     "alembic>=1.13.0",
     "psycopg[binary]>=3.1.0",     # psycopg3 driver (postgresql+psycopg://)
     "tzdata>=2024.1",              # Windows: IANA timezone data for zoneinfo
+    "yfinance>=0.2",
 ]
 
 
