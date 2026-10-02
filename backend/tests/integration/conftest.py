@@ -1,16 +1,16 @@
 from collections.abc import Generator
 
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import Session
 
-import app.infrastructure.database.registry  # noqa: F401 — registers all ORM models
+import app.infrastructure.database.registry  # noqa: F401 - registers all ORM models
 from app.core.config import settings
 from app.infrastructure.database.base import Base
 
 
 @pytest.fixture(scope="session")
-def db_engine():
+def db_engine() -> Generator[Engine, None, None]:
     """Create a test engine and build all tables once per session."""
     engine = create_engine(
         settings.database_url,
@@ -23,7 +23,7 @@ def db_engine():
 
 
 @pytest.fixture
-def db_session(db_engine) -> Generator[Session, None, None]:
+def db_session(db_engine: Engine) -> Generator[Session, None, None]:
     """
     Provide a transactional session that rolls back after each test.
     Uses SQLAlchemy 2.x-compatible Session(bind=...) via join_transaction_mode.
