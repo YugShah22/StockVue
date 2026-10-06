@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 from uuid import UUID
 
 from sqlalchemy import select
@@ -35,16 +35,65 @@ class PostgresFundamentalRecordRepository(FundamentalRecordRepository):
         self,
         instrument_id: UUID,
         period_end: date,
+        as_of: datetime | None = None,
     ) -> list[FundamentalRecord]:
-        statement = (
-            select(FundamentalRecordModel)
-            .where(
-                FundamentalRecordModel.instrument_id == instrument_id,
-                FundamentalRecordModel.period_end == period_end,
+        statement = select(FundamentalRecordModel).where(
+            FundamentalRecordModel.instrument_id == instrument_id,
+            FundamentalRecordModel.period_end == period_end,
+        )
+
+        if as_of is not None:
+            if as_of.tzinfo is None:
+                raise ValueError("as_of must be timezone-aware")
+            statement = statement.where(
+                FundamentalRecordModel.available_at.is_not(None),
+                FundamentalRecordModel.available_at <= as_of,
             )
-            .order_by(
-                FundamentalRecordModel.metric_name,
+
+        statement = statement.order_by(
+            FundamentalRecordModel.metric_name,
+        )
+
+        models = self.session.scalars(statement).all()
+
+        return [self._to_domain(model) for model in models]
+
+    def get_as_of(
+        self,
+        instrument_id: UUID,
+        as_of: datetime,
+        start_period: date | None = None,
+        end_period: date | None = None,
+        metric_name: str | None = None,
+    ) -> list[FundamentalRecord]:
+        if as_of.tzinfo is None:
+            raise ValueError("as_of must be timezone-aware")
+
+        statement = select(FundamentalRecordModel).where(
+            FundamentalRecordModel.instrument_id == instrument_id,
+            FundamentalRecordModel.available_at.is_not(None),
+            FundamentalRecordModel.available_at <= as_of,
+        )
+
+        if start_period is not None:
+            statement = statement.where(
+                FundamentalRecordModel.period_end >= start_period
             )
+
+        if end_period is not None:
+            statement = statement.where(
+                FundamentalRecordModel.period_end <= end_period
+            )
+
+        if metric_name is not None:
+            statement = statement.where(
+                FundamentalRecordModel.metric_name == metric_name.strip().lower()
+            )
+
+        statement = statement.order_by(
+            FundamentalRecordModel.period_end.asc(),
+            FundamentalRecordModel.metric_name.asc(),
+            FundamentalRecordModel.available_at.asc(),
         )
 
         models = self.session.scalars(statement).all()

@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from decimal import Decimal
 from unittest.mock import MagicMock, patch
 from uuid import UUID, uuid4
 
@@ -67,8 +68,10 @@ def test_get_bars_normalizes_yfinance_data(mock_ticker: MagicMock) -> None:
     )
 
     assert len(bars) == 2
-    assert bars[0].close == 105.0
-    assert bars[1].close == 110.0
+    assert isinstance(bars[0].close, Decimal)
+    assert isinstance(bars[0].volume, Decimal)
+    assert bars[0].close == Decimal("105.0")
+    assert bars[1].close == Decimal("110.0")
 
     mock_ticker.assert_called_once_with("RELIANCE.NS")
     repository.get_by_id.assert_called_once_with(instrument_id)
@@ -125,9 +128,10 @@ def test_get_latest_bar_returns_latest_observation(mock_ticker: MagicMock) -> No
 
     bar = provider.get_latest_bar(instrument_id, "1d")
 
-    assert bar.close == 110.0
-    assert bar.volume == 1200.0
-
+    assert isinstance(bar.close, Decimal)
+    assert isinstance(bar.volume, Decimal)
+    assert bar.close == Decimal("110.0")
+    assert bar.volume == Decimal("1200.0")
 
 @patch("app.infrastructure.providers.development.yfinance_market_data.yf.Ticker")
 def test_get_latest_bar_raises_when_no_data(mock_ticker: MagicMock) -> None:

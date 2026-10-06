@@ -1,14 +1,21 @@
 from dataclasses import dataclass
-from datetime import date
-from uuid import UUID
+from datetime import UTC, date, datetime
+from uuid import UUID, uuid4
 
 from app.core.exceptions import InstrumentNotFoundError
 from app.domain.entities.fundamental_record import FundamentalRecord
+from app.domain.entities.ingestion_run import IngestionRun
 from app.domain.providers.fundamentals import FundamentalsProvider
 from app.domain.repositories.fundamental_record_repository import (
     FundamentalRecordRepository,
 )
+from app.domain.repositories.ingestion_run_repository import (
+    IngestionRunRepository,
+)
 from app.domain.repositories.instrument_repository import InstrumentRepository
+from app.domain.services.fundamental_record_validator import (
+    FundamentalRecordValidator,
+)
 
 
 @dataclass(frozen=True)
@@ -28,12 +35,60 @@ class FundamentalsIngestionService:
         instrument_repository: InstrumentRepository,
         fundamental_record_repository: FundamentalRecordRepository,
         fundamentals_provider: FundamentalsProvider,
+        ingestion_run_repository: IngestionRunRepository | None = None,
     ) -> None:
         self._instrument_repository = instrument_repository
         self._fundamental_record_repository = fundamental_record_repository
         self._fundamentals_provider = fundamentals_provider
+        self._ingestion_run_repository = ingestion_run_repository
 
     def ingest(
+        self,
+        instrument_id: UUID,
+        start_period: date,
+        end_period: date,
+    ) -> FundamentalsIngestionResult:
+        provider_name = getattr(
+            self._fundamentals_provider,
+            "name",
+            self._fundamentals_provider.__class__.__name__,
+        )
+        started_at = datetime.now(UTC)
+        run = IngestionRun(
+            run_id=uuid4(),
+            ingestion_type="fundamentals",
+            instrument_id=instrument_id,
+            provider=provider_name,
+            started_at=started_at,
+            status="RUNNING",
+        )
+        if self._ingestion_run_repository is not None:
+            self._ingestion_run_repository.save(run)
+
+        try:
+            result = self._execute_ingest(
+                instrument_id=instrument_id,
+                start_period=start_period,
+                end_period=end_period,
+            )
+            if self._ingestion_run_repository is not None:
+                run.status = "SUCCESS"
+                run.completed_at = datetime.now(UTC)
+                run.received_count = result.received_count
+                run.inserted_count = result.inserted_count
+                run.updated_count = result.updated_count
+                run.skipped_count = result.skipped_count
+                self._ingestion_run_repository.save(run)
+            return result
+        except Exception as exc:
+            if self._ingestion_run_repository is not None:
+                run.status = "FAILED"
+                run.completed_at = datetime.now(UTC)
+                run.error_message = str(exc)
+                self._ingestion_run_repository.save(run)
+            raise
+
+    def _execute_ingest(
         self,
         instrument_id: UUID,
         start_period: date,
@@ -47,6 +102,13 @@ class FundamentalsIngestionService:
             )
 
         records = self._fundamentals_provider.get_fundamentals(
+            instrument_id=instrument_id,
+            start_period=start_period,
+            end_period=end_period,
+        )
+
+        FundamentalRecordValidator.validate_batch(
+            records=records,
             instrument_id=instrument_id,
             start_period=start_period,
             end_period=end_period,

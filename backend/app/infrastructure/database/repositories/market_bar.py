@@ -1,7 +1,9 @@
+from collections.abc import Sequence
 from datetime import datetime
 from uuid import UUID
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.domain.entities.market_bar import MarketBar
@@ -21,6 +23,50 @@ class PostgresMarketBarRepository(MarketBarRepository):
         statement = select(MarketBarModel).where(
             MarketBarModel.instrument_id == instrument_id,
             MarketBarModel.timestamp == timestamp,
+        )
+
+        model = self.session.scalar(statement)
+
+        if model is None:
+            return None
+
+        return self._to_domain(model)
+
+    def get_bars(
+        self,
+        instrument_id: UUID,
+        start: datetime,
+        end: datetime,
+    ) -> list[MarketBar]:
+        statement = (
+            select(MarketBarModel)
+            .where(
+                MarketBarModel.instrument_id == instrument_id,
+                MarketBarModel.timestamp >= start,
+                MarketBarModel.timestamp <= end,
+            )
+            .order_by(
+                MarketBarModel.timestamp.asc(),
+            )
+        )
+
+        models = self.session.scalars(statement).all()
+
+        return [self._to_domain(model) for model in models]
+
+    def get_latest_bar(
+        self,
+        instrument_id: UUID,
+    ) -> MarketBar | None:
+        statement = (
+            select(MarketBarModel)
+            .where(
+                MarketBarModel.instrument_id == instrument_id,
+            )
+            .order_by(
+                MarketBarModel.timestamp.desc(),
+            )
+            .limit(1)
         )
 
         model = self.session.scalar(statement)
@@ -58,6 +104,44 @@ class PostgresMarketBarRepository(MarketBarRepository):
             model.volume = market_bar.volume
 
         self.session.flush()
+
+    def upsert_bars(self, bars: Sequence[MarketBar]) -> None:
+        if not bars:
+            return
+
+        unique_bars: dict[tuple[UUID, datetime], MarketBar] = {}
+        for bar in bars:
+            unique_bars[(bar.instrument_id, bar.timestamp)] = bar
+
+        values = [
+            {
+                "market_bar_id": bar.market_bar_id,
+                "instrument_id": bar.instrument_id,
+                "timestamp": bar.timestamp,
+                "open": bar.open,
+                "high": bar.high,
+                "low": bar.low,
+                "close": bar.close,
+                "volume": bar.volume,
+            }
+            for bar in unique_bars.values()
+        ]
+
+        statement = pg_insert(MarketBarModel).values(values)
+        statement = statement.on_conflict_do_update(
+            index_elements=[MarketBarModel.instrument_id, MarketBarModel.timestamp],
+            set_={
+                "open": statement.excluded.open,
+                "high": statement.excluded.high,
+                "low": statement.excluded.low,
+                "close": statement.excluded.close,
+                "volume": statement.excluded.volume,
+            },
+        )
+
+        self.session.execute(statement)
+        self.session.flush()
+        self.session.expire_all()
 
     def _to_domain(self, model: MarketBarModel) -> MarketBar:
         return MarketBar(

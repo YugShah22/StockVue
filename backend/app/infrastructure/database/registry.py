@@ -19,9 +19,15 @@ intentional side-effect imports and are suppressed via per-file-ignores.
 
 # noqa: F401, E402 applied via pyproject.toml per-file-ignores for this file.
 from app.infrastructure.database.models.company import CompanyModel  # noqa: F401
+from app.infrastructure.database.models.corporate_action import (  # noqa: F401
+    CorporateActionModel,
+)
 from app.infrastructure.database.models.exchange import ExchangeModel  # noqa: F401
 from app.infrastructure.database.models.fundamental_record import (
     FundamentalRecordModel,
+)
+from app.infrastructure.database.models.ingestion_run import (  # noqa: F401
+    IngestionRunModel,
 )
 from app.infrastructure.database.models.instrument import InstrumentModel  # noqa: F401
 from app.infrastructure.database.models.instrument_history import (  # noqa: F401
@@ -34,10 +40,12 @@ from app.infrastructure.database.models.market_holiday import (  # noqa: F401
 
 __all__ = [
     "CompanyModel",
+    "CorporateActionModel",
     "ExchangeModel",
+    "FundamentalRecordModel",
+    "IngestionRunModel",
     "InstrumentModel",
     "InstrumentHistoryModel",
     "MarketBarModel",
     "MarketHolidayModel",
-    "FundamentalRecordModel",
 ]

@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from decimal import Decimal
 from uuid import UUID
 
 import yfinance as yf
@@ -105,11 +106,11 @@ class YFinanceMarketDataProvider(MarketDataProvider):
                 MarketBar(
                     instrument_id=instrument_id,
                     timestamp=normalized_timestamp,
-                    open=float(row["Open"]),
-                    high=float(row["High"]),
-                    low=float(row["Low"]),
-                    close=float(row["Close"]),
-                    volume=float(row["Volume"]),
+                    open=Decimal(str(row["Open"])),
+                    high=Decimal(str(row["High"])),
+                    low=Decimal(str(row["Low"])),
+                    close=Decimal(str(row["Close"])),
+                    volume=Decimal(str(row["Volume"])),
                 )
             )
 
@@ -146,11 +147,11 @@ class YFinanceMarketDataProvider(MarketDataProvider):
             timestamp=self._normalize_timestamp(
                 timestamp.to_pydatetime()
             ),
-            open=float(row["Open"]),
-            high=float(row["High"]),
-            low=float(row["Low"]),
-            close=float(row["Close"]),
-            volume=float(row["Volume"]),
+            open=Decimal(str(row["Open"])),
+            high=Decimal(str(row["High"])),
+            low=Decimal(str(row["Low"])),
+            close=Decimal(str(row["Close"])),
+            volume=Decimal(str(row["Volume"])),
         )
 
     def get_quote(
