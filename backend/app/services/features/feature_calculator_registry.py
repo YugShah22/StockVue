@@ -50,9 +50,11 @@ class FeatureCalculatorRegistry:
 
 def create_default_feature_registry() -> FeatureCalculatorRegistry:
     from app.domain.features.calculators.return_calculator import ReturnCalculator
+    from app.domain.features.calculators.rsi_calculator import RSICalculator
     from app.domain.features.calculators.sma_calculator import SMACalculator
 
     registry = FeatureCalculatorRegistry()
     registry.register(ReturnCalculator())
     registry.register(SMACalculator())
+    registry.register(RSICalculator())
     return registry
