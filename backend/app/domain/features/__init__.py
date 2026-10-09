@@ -1,3 +1,5 @@
+from app.domain.features.calculators.return_calculator import ReturnCalculator
+from app.domain.features.calculators.sma_calculator import SMACalculator
 from app.domain.features.feature_calculation_context import FeatureCalculationContext
 from app.domain.features.feature_calculator import FeatureCalculator
 from app.domain.features.feature_category import FeatureCategory
@@ -10,4 +12,6 @@ __all__ = [
     "FeatureCategory",
     "FeatureDefinition",
     "FeatureValue",
+    "ReturnCalculator",
+    "SMACalculator",
 ]
