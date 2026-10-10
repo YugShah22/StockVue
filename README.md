@@ -124,8 +124,8 @@ mypy app/
 |---|---|---|
 | 0 | Architecture & Planning | ✅ Complete |
 | 1 | Foundation & Skeleton | ✅ Complete |
-| 2 | Database Layer | 🔲 Not started |
-| 3 | Data Ingestion | 🔲 Not started |
+| 2 | Database Layer | ✅ Complete |
+| 3 | Data Ingestion | ✅ Complete |
 | 4 | Factor & Feature Engine | 🔲 Not started |
 | 5 | ML Model Foundation | 🔲 Not started |
 | 6 | Prediction & Explainability | 🔲 Not started |

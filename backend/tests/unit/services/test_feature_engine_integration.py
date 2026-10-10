@@ -6,6 +6,7 @@ import pytest
 
 from app.domain.entities.market_bar import MarketBar
 from app.domain.features.calculators.atr_calculator import ATRCalculator
+from app.domain.features.calculators.bollinger_bands_calculator import BollingerBandsCalculator
 from app.domain.features.calculators.return_calculator import ReturnCalculator
 from app.domain.features.calculators.rsi_calculator import RSICalculator
 from app.domain.features.calculators.sma_calculator import SMACalculator
@@ -36,19 +37,21 @@ def make_bar(
 
 
 class TestFeatureEngineIntegration:
-    def test_default_registry_has_all_four_calculators(self) -> None:
+    def test_default_registry_has_all_five_calculators(self) -> None:
         registry = create_default_feature_registry()
-        assert len(registry) == 4
+        assert len(registry) == 5
         assert "return" in registry
         assert "sma" in registry
         assert "rsi" in registry
         assert "atr" in registry
+        assert "bollinger_bands" in registry
         assert isinstance(registry.get("return"), ReturnCalculator)
         assert isinstance(registry.get("sma"), SMACalculator)
         assert isinstance(registry.get("rsi"), RSICalculator)
         assert isinstance(registry.get("atr"), ATRCalculator)
+        assert isinstance(registry.get("bollinger_bands"), BollingerBandsCalculator)
 
-    def test_all_four_calculator_families_work_side_by_side(self) -> None:
+    def test_all_five_calculator_families_work_side_by_side(self) -> None:
         registry = create_default_feature_registry()
         engine = FeatureEngine(registry)
 
@@ -97,11 +100,32 @@ class TestFeatureEngineIntegration:
             description="14-period ATR",
             parameters={"window": 14},
         )
+        def_bb_mid = FeatureDefinition(
+            name="bollinger_bands",
+            category=FeatureCategory.TECHNICAL,
+            description="5-period BB middle",
+            parameters={"window": 5, "k": 2, "band": "middle"},
+        )
+        def_bb_upper = FeatureDefinition(
+            name="bollinger_bands",
+            category=FeatureCategory.TECHNICAL,
+            description="5-period BB upper",
+            parameters={"window": 5, "k": 2, "band": "upper"},
+        )
+        def_bb_lower = FeatureDefinition(
+            name="bollinger_bands",
+            category=FeatureCategory.TECHNICAL,
+            description="5-period BB lower",
+            parameters={"window": 5, "k": 2, "band": "lower"},
+        )
 
         val_return = engine.calculate(def_return, context)
         val_sma = engine.calculate(def_sma, context)
         val_rsi = engine.calculate(def_rsi, context)
         val_atr = engine.calculate(def_atr, context)
+        val_bb_mid = engine.calculate(def_bb_mid, context)
+        val_bb_upper = engine.calculate(def_bb_upper, context)
+        val_bb_lower = engine.calculate(def_bb_lower, context)
 
         # Verify Return calculation result
         assert isinstance(val_return, FeatureValue)
@@ -136,6 +160,28 @@ class TestFeatureEngineIntegration:
         assert val_atr.observation_date == as_of
         # Every bar has high - low = 4, |high - prev_close| = 4 -> TR = 4 -> ATR = 4
         assert val_atr.value == Decimal("4")
+
+        # Verify Bollinger Bands calculation results (middle, upper, lower)
+        expected_variance = Decimal("40") / Decimal("5")  # sum of squared deviations from mean 134 is 40
+        expected_std_dev = expected_variance.sqrt()
+
+        assert isinstance(val_bb_mid, FeatureValue)
+        assert val_bb_mid.feature is def_bb_mid
+        assert val_bb_mid.instrument_id == inst_id
+        assert val_bb_mid.observation_date == as_of
+        assert val_bb_mid.value == Decimal("134")
+
+        assert isinstance(val_bb_upper, FeatureValue)
+        assert val_bb_upper.feature is def_bb_upper
+        assert val_bb_upper.instrument_id == inst_id
+        assert val_bb_upper.observation_date == as_of
+        assert val_bb_upper.value == Decimal("134") + (Decimal("2") * expected_std_dev)
+
+        assert isinstance(val_bb_lower, FeatureValue)
+        assert val_bb_lower.feature is def_bb_lower
+        assert val_bb_lower.instrument_id == inst_id
+        assert val_bb_lower.observation_date == as_of
+        assert val_bb_lower.value == Decimal("134") - (Decimal("2") * expected_std_dev)
 
     def test_parameterized_families_on_same_context(self) -> None:
         registry = create_default_feature_registry()
@@ -175,6 +221,24 @@ class TestFeatureEngineIntegration:
         atr_14 = FeatureDefinition(
             name="atr", category=FeatureCategory.TECHNICAL, description="14d", parameters={"window": 14}
         )
+        bb_20_mid = FeatureDefinition(
+            name="bollinger_bands",
+            category=FeatureCategory.TECHNICAL,
+            description="20d mid",
+            parameters={"window": 20, "band": "middle"},
+        )
+        bb_20_upper = FeatureDefinition(
+            name="bollinger_bands",
+            category=FeatureCategory.TECHNICAL,
+            description="20d upper",
+            parameters={"window": 20, "k": Decimal("2.5"), "band": "upper"},
+        )
+        bb_20_lower = FeatureDefinition(
+            name="bollinger_bands",
+            category=FeatureCategory.TECHNICAL,
+            description="20d lower",
+            parameters={"window": 20, "k": Decimal("2.5"), "band": "lower"},
+        )
 
         res_ret_1 = engine.calculate(ret_1, context)
         res_ret_5 = engine.calculate(ret_5, context)
@@ -182,6 +246,9 @@ class TestFeatureEngineIntegration:
         res_sma_20 = engine.calculate(sma_20, context)
         res_rsi_14 = engine.calculate(rsi_14, context)
         res_atr_14 = engine.calculate(atr_14, context)
+        res_bb_20_mid = engine.calculate(bb_20_mid, context)
+        res_bb_20_upper = engine.calculate(bb_20_upper, context)
+        res_bb_20_lower = engine.calculate(bb_20_lower, context)
 
         assert isinstance(res_ret_1, FeatureValue)
         assert res_ret_1.value == Decimal("0")
@@ -202,6 +269,18 @@ class TestFeatureEngineIntegration:
         assert isinstance(res_atr_14, FeatureValue)
         # Flat prices -> 0 true range
         assert res_atr_14.value == Decimal("0")
+
+        assert isinstance(res_bb_20_mid, FeatureValue)
+        # Flat prices -> standard deviation 0 -> middle is 100.00
+        assert res_bb_20_mid.value == Decimal("100.00")
+
+        assert isinstance(res_bb_20_upper, FeatureValue)
+        # Flat prices -> standard deviation 0 -> upper is 100.00
+        assert res_bb_20_upper.value == Decimal("100.00")
+
+        assert isinstance(res_bb_20_lower, FeatureValue)
+        # Flat prices -> standard deviation 0 -> lower is 100.00
+        assert res_bb_20_lower.value == Decimal("100.00")
 
     def test_insufficient_history_propagates_none_through_engine(self) -> None:
         registry = create_default_feature_registry()
@@ -245,6 +324,12 @@ class TestFeatureEngineIntegration:
             name="atr", category=FeatureCategory.TECHNICAL, description="14d", parameters={"window": 14}
         )
         assert engine.calculate(def_atr_14, context) is None
+
+        # 20-period Bollinger Bands needs 20 bars -> returns None
+        def_bb_20 = FeatureDefinition(
+            name="bollinger_bands", category=FeatureCategory.TECHNICAL, description="20d", parameters={"window": 20}
+        )
+        assert engine.calculate(def_bb_20, context) is None
 
     def test_unknown_calculator_name_raises_key_error(self) -> None:
         registry = create_default_feature_registry()
