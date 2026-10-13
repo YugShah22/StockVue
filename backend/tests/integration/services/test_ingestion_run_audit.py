@@ -15,7 +15,7 @@ from app.domain.entities.market_bar import MarketBar
 from app.domain.enums.asset_type import AssetType
 from app.domain.enums.instrument_status import InstrumentStatus
 from app.domain.providers.fundamentals import FundamentalsProvider
-from app.domain.providers.market_data import MarketDataProvider
+from app.domain.providers.market_data import MarketDataProvider, MarketQuote
 from app.domain.value_objects.exchange_code import ExchangeCode
 from app.domain.value_objects.isin import ISIN
 from app.domain.value_objects.symbol import Symbol
@@ -53,6 +53,19 @@ class FakeMarketDataProvider(MarketDataProvider):
         interval: str,
     ) -> list[MarketBar]:
         return self._bars
+
+    def get_latest_bar(
+        self,
+        instrument_id: UUID,
+        interval: str,
+    ) -> MarketBar:
+        raise NotImplementedError
+
+    def get_quote(
+        self,
+        instrument_id: UUID,
+    ) -> MarketQuote:
+        raise NotImplementedError
 
 
 class FakeFundamentalsProvider(FundamentalsProvider):

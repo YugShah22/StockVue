@@ -72,11 +72,11 @@ class MarketDataService:
         end: datetime,
     ) -> list[MarketBar]:
         """Look up instrument by symbol and exchange, then retrieve bars in [start, end]."""
-        sym = symbol if isinstance(symbol, Symbol) else Symbol(str(symbol))
+        sym = symbol if isinstance(symbol, Symbol) else Symbol(symbol)
         code = (
             exchange_code
             if isinstance(exchange_code, ExchangeCode)
-            else ExchangeCode(str(exchange_code))
+            else ExchangeCode(exchange_code)
         )
         instrument = self._inst_repo.get_by_symbol(sym, code)
         if instrument is None:
@@ -91,11 +91,11 @@ class MarketDataService:
         exchange_code: ExchangeCode | str,
     ) -> MarketBar | None:
         """Look up instrument by symbol and exchange, then retrieve latest bar."""
-        sym = symbol if isinstance(symbol, Symbol) else Symbol(str(symbol))
+        sym = symbol if isinstance(symbol, Symbol) else Symbol(symbol)
         code = (
             exchange_code
             if isinstance(exchange_code, ExchangeCode)
-            else ExchangeCode(str(exchange_code))
+            else ExchangeCode(exchange_code)
         )
         instrument = self._inst_repo.get_by_symbol(sym, code)
         if instrument is None:
