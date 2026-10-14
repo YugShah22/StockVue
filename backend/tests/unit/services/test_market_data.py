@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 from decimal import Decimal
 from unittest.mock import MagicMock
-from uuid import uuid4
+from uuid import uuid4,UUID
 
 import pytest
 
@@ -50,7 +50,7 @@ def sample_instrument() -> Instrument:
     )
 
 
-def make_bar(instrument_id, ts, close="100.0") -> MarketBar:
+def make_bar(instrument_id: UUID, ts: datetime, close: str = "100.0") -> MarketBar:
     return MarketBar(
         instrument_id=instrument_id,
         timestamp=ts,
@@ -149,7 +149,7 @@ class TestMarketDataService:
         sample_instrument: Instrument,
     ) -> None:
         mock_inst_repo.get_by_id.return_value = sample_instrument
-        mock_bar_repo.get_bars.return_value = []
+        mock_bar_repo.get_bars.return_value = []  # type: ignore
 
         result = market_data_service.get_historical_bars(
             sample_instrument.instrument_id,

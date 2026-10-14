@@ -58,11 +58,11 @@ class SecurityMasterService:
         exchange_code: ExchangeCode | str,
     ) -> Instrument | None:
         """Look up instrument by current symbol and exchange code."""
-        sym = symbol if isinstance(symbol, Symbol) else Symbol(str(symbol))
+        sym = symbol if isinstance(symbol, Symbol) else Symbol(symbol)
         code = (
             exchange_code
             if isinstance(exchange_code, ExchangeCode)
-            else ExchangeCode(str(exchange_code))
+            else ExchangeCode(exchange_code)
         )
         return self._instrument_repo.get_by_symbol(sym, code)
 
@@ -202,14 +202,14 @@ class SecurityMasterService:
         code = (
             exchange_code
             if isinstance(exchange_code, ExchangeCode)
-            else ExchangeCode(str(exchange_code))
+            else ExchangeCode(exchange_code)
         )
         exchange = self._exchange_repo.get_by_code(code)
         if exchange is None:
             raise DataNotFoundError(f"Exchange not found: {code}")
 
-        sym = symbol if isinstance(symbol, Symbol) else Symbol(str(symbol))
-        isin_vo = isin if isinstance(isin, ISIN) else ISIN(str(isin))
+        sym = symbol if isinstance(symbol, Symbol) else Symbol(symbol)
+        isin_vo = isin if isinstance(isin, ISIN) else ISIN(isin)
         inst_id = instrument_id or uuid4()
 
         instrument = Instrument(

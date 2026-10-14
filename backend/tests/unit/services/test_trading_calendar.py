@@ -31,9 +31,11 @@ def mock_holiday_repo() -> MagicMock:
 @pytest.fixture
 def mock_exchange_repo(exchange: Exchange) -> MagicMock:
     repo = MagicMock()
-    repo.get_by_code.side_effect = lambda code: (
-        exchange if str(code) == "NSE" else None
-    )
+
+    def get_by_code(code: ExchangeCode | str) -> Exchange | None:
+        return exchange if str(code) == "NSE" else None
+
+    repo.get_by_code.side_effect = get_by_code
     return repo
 
 
