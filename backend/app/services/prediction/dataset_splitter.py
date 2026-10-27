@@ -113,18 +113,16 @@ class DatasetSplitter:
        segment (when `config.purge_overlap is True`).  A validation row is
        purged when::
 
-           row.observation_date < last_train_realization_date
+           row.observation_date < max_train_realization_date
 
-       where `last_train_realization_date` is the `realization_date` of the
-       last row in the training segment.
+       where `max_train_realization_date` is the maximum `realization_date`
+       across all rows in the training segment.
 
     4. **Embargo** the first `config.embargo_bars` rows from the head of the
        validation segment (after purging).
 
-    5. Repeat steps 3 and 4 for the test segment, using the last row of the
-       *retained* validation segment (after purging and embargo) as the boundary.
-       If the retained validation segment is empty, the boundary is the last
-       training row.
+    5. Repeat steps 3 and 4 for the test segment, using the maximum `realization_date`
+       across all retained prior rows (training and validation) as the boundary.
 
     6. Build and return an immutable :class:SplitResult.
 
@@ -206,30 +204,48 @@ class DatasetSplitter:
         test_raw: tuple[DatasetRow, ...] = rows[train_size + val_size :]
 
         # --- 3 & 4. Purge and embargo validation split -----------------------
+        max_train_realization = max(r.realization_date for r in train_raw)
         val_rows, val_purged, val_embargoed = _apply_purge_and_embargo(
             segment=val_raw,
-            boundary_row=train_raw[-1],
+            max_prior_realization_date=max_train_realization,
             purge_overlap=config.purge_overlap,
             embargo_bars=config.embargo_bars,
         )
 
+        if len(val_rows) == 0:
+            raise ValueError(
+                f"Purging and embargo removed all rows from validation split "
+                f"({val_purged} purged, {val_embargoed} embargoed); "
+                f"increase val_fraction, decrease embargo_bars, or provide more data"
+            )
+
         # --- 5. Purge and embargo test split ---------------------------------
-        # Boundary is the last retained row in val; fall back to last train row
-        # when val is completely empty after purging + embargo.
-        val_boundary_row = val_rows[-1] if val_rows else train_raw[-1]
+        # Test rows must not overlap with ANY prior split (train or validation).
+        # We take the maximum realization date across all retained prior rows.
+        max_prior_realization = max(
+            max_train_realization,
+            max(r.realization_date for r in val_rows),
+        )
         test_rows, test_purged, test_embargoed = _apply_purge_and_embargo(
             segment=test_raw,
-            boundary_row=val_boundary_row,
+            max_prior_realization_date=max_prior_realization,
             purge_overlap=config.purge_overlap,
             embargo_bars=config.embargo_bars,
         )
+
+        if len(test_rows) == 0:
+            raise ValueError(
+                f"Purging and embargo removed all rows from test split "
+                f"({test_purged} purged, {test_embargoed} embargoed); "
+                f"increase test_fraction, decrease embargo_bars, or provide more data"
+            )
 
         # --- 6. Build boundary metadata --------------------------------------
         boundary = SplitBoundary(
             last_train_observation_date=train_raw[-1].observation_date,
-            first_val_observation_date=val_rows[0].observation_date if val_rows else None,
-            last_val_observation_date=val_rows[-1].observation_date if val_rows else None,
-            first_test_observation_date=test_rows[0].observation_date if test_rows else None,
+            first_val_observation_date=val_rows[0].observation_date,
+            last_val_observation_date=val_rows[-1].observation_date,
+            first_test_observation_date=test_rows[0].observation_date,
         )
 
         return SplitResult(
@@ -248,7 +264,7 @@ class DatasetSplitter:
 
 def _apply_purge_and_embargo(
     segment: tuple[DatasetRow, ...],
-    boundary_row: DatasetRow,
+    max_prior_realization_date: date,
     purge_overlap: bool,
     embargo_bars: int,
 ) -> tuple[tuple[DatasetRow, ...], int, int]:
@@ -258,12 +274,13 @@ def _apply_purge_and_embargo(
     ----------
     segment:
         Raw chronologically ordered rows to process.
-    boundary_row:
-        The last *kept* row in the preceding split.  Its `realization_date`
-        defines the overlap boundary.
+    max_prior_realization_date:
+        The maximum `realization_date` across all rows of the preceding split(s).
+        Any row in *segment* whose `observation_date` is strictly before this date
+        overlaps with a prior target interval.
     purge_overlap:
         When `True`, rows whose `observation_date` is strictly less than
-        `boundary_row.realization_date` are removed.
+        `max_prior_realization_date` are removed.
     embargo_bars:
         Number of additional rows to remove after purging.
 
@@ -282,10 +299,11 @@ def _apply_purge_and_embargo(
     remaining = segment
 
     if purge_overlap:
-        last_realization = boundary_row.realization_date
         cut = 0
         for row in remaining:
-            if row.observation_date < last_realization:
+            # Strictly less-than: target interval (observation_date, realization_date] is half-open.
+            # Equality (row.observation_date == max_prior_realization_date) is NOT an overlap.
+            if row.observation_date < max_prior_realization_date:
                 cut += 1
             else:
                 break

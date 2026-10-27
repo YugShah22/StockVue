@@ -13,6 +13,7 @@ from app.domain.features.feature_category import FeatureCategory
 from app.domain.features.feature_definition import FeatureDefinition
 from app.domain.prediction.dataset import DatasetRow, FeatureMatrix
 from app.domain.prediction.split_config import SplitConfig
+from app.domain.prediction.split_result import SplitBoundary
 from app.domain.prediction.target_definition import TargetDefinition
 from app.services.prediction.dataset_splitter import DatasetSplitter, DatasetValidator
 
@@ -235,20 +236,70 @@ class TestDatasetValidator:
                 ),
             )
 
-    def test_duplicate_observation_dates_rejected(self, validator: DatasetValidator) -> None:
-        obs = date(2024, 1, 1)
-        # FeatureMatrix itself rejects duplicates on construction.
-        with pytest.raises(ValueError):
-            FeatureMatrix(
-                instrument_id=_INST_ID,
-                feature_names=("sma_window_5",),
-                feature_definitions=(_make_feature_def(),),
-                target_definition=_make_target_def(),
-                rows=(
-                    _make_row(obs),
-                    _make_row(obs),
-                ),
-            )
+    def test_duplicate_observation_dates_rejected_by_validator(
+        self, validator: DatasetValidator
+    ) -> None:
+        m = _make_matrix(2)
+        # Directly test validator defense-in-depth against duplicate observation dates
+        r0 = m.rows[0]
+        r_dup = DatasetRow(
+            instrument_id=m.instrument_id,
+            observation_date=r0.observation_date,
+            realization_date=r0.realization_date,
+            feature_values=r0.feature_values,
+            target_value=r0.target_value,
+        )
+        object.__setattr__(m, "rows", (r0, r_dup))
+        with pytest.raises(ValueError, match="duplicate observation_date"):
+            validator.validate(m)
+
+    def test_unsorted_observation_dates_rejected_by_validator(
+        self, validator: DatasetValidator
+    ) -> None:
+        m = _make_matrix(2)
+        object.__setattr__(m, "rows", (m.rows[1], m.rows[0]))
+        with pytest.raises(ValueError, match="chronologically ordered"):
+            validator.validate(m)
+
+    def test_mixed_instruments_rejected_by_validator(self, validator: DatasetValidator) -> None:
+        m = _make_matrix(2)
+        other_id = UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+        r_other = DatasetRow(
+            instrument_id=other_id,
+            observation_date=m.rows[1].observation_date,
+            realization_date=m.rows[1].realization_date,
+            feature_values=m.rows[1].feature_values,
+            target_value=m.rows[1].target_value,
+        )
+        object.__setattr__(m, "rows", (m.rows[0], r_other))
+        with pytest.raises(ValueError, match="instrument_id"):
+            validator.validate(m)
+
+    def test_non_finite_feature_values_rejected_by_validator(
+        self, validator: DatasetValidator
+    ) -> None:
+        m = _make_matrix(1)
+        r0 = m.rows[0]
+        object.__setattr__(r0, "feature_values", (Decimal("NaN"),))
+        with pytest.raises(ValueError, match="not finite"):
+            validator.validate(m)
+
+        object.__setattr__(r0, "feature_values", (Decimal("Infinity"),))
+        with pytest.raises(ValueError, match="not finite"):
+            validator.validate(m)
+
+    def test_non_finite_target_value_rejected_by_validator(
+        self, validator: DatasetValidator
+    ) -> None:
+        m = _make_matrix(1)
+        r0 = m.rows[0]
+        object.__setattr__(r0, "target_value", Decimal("NaN"))
+        with pytest.raises(ValueError, match="not finite"):
+            validator.validate(m)
+
+        object.__setattr__(r0, "target_value", Decimal("-Infinity"))
+        with pytest.raises(ValueError, match="not finite"):
+            validator.validate(m)
 
 
 # ===========================================================================
@@ -374,19 +425,16 @@ class TestDatasetSplitterPurge:
         return _make_matrix(n, horizon=horizon)
 
     def test_purge_removes_overlapping_val_rows(self, splitter: DatasetSplitter) -> None:
-        """With horizon=5, the last train row's realization reaches 5 days ahead.
-        Val rows whose observation_date < that realization_date must be purged."""
-        # 30 rows, horizon=5
-        # train=floor(0.7*30)=21, val=floor(0.15*30)=4, test=30-21-4=5
-        # Last train row: obs=day20 (0-indexed), real=day20+5=day25.
-        # Val starts at day21. Purge condition: obs_date < day25.
-        # day21 < day25 -> purge. day22 < day25 -> purge. day23 < day25 -> purge.
-        # day24 < day25 -> purge. So all 4 val rows are purged.
-        m = self._make_matrix_with_horizon(30, horizon=5)
+        """With horizon=3 and 40 rows, overlapping val rows are purged while keeping non-overlapping."""
+        # 40 rows, horizon=3: train=floor(0.7*40)=28, val=floor(0.15*40)=6
+        # last train row: obs=day27, real=day30.
+        # val starts at day28. day28, day29 < day30 -> 2 purged.
+        # day30, day31, day32, day33 >= day30 -> 4 kept.
+        m = self._make_matrix_with_horizon(40, horizon=3)
         cfg = SplitConfig(train_fraction=0.70, val_fraction=0.15, test_fraction=0.15)
         result = splitter.split(m, cfg)
-        assert result.val_rows_purged == 4  # all 4 raw val rows purged
-        assert result.val_size == 0
+        assert result.val_rows_purged == 2
+        assert result.val_size == 4
 
     def test_purge_disabled_keeps_all_val_rows(self, splitter: DatasetSplitter) -> None:
         m = self._make_matrix_with_horizon(30, horizon=5)
@@ -444,21 +492,15 @@ class TestDatasetSplitterPurge:
         result = splitter.split(m, cfg)
         assert result.test_rows_purged == 2
 
-    def test_test_boundary_falls_back_to_train_when_val_empty(
+    def test_purge_consuming_entire_val_split_raises_value_error(
         self, splitter: DatasetSplitter
     ) -> None:
-        """When all val rows are purged, test boundary uses last train row."""
-        # horizon=5, 30 rows: all 4 val rows purged.
-        # Last train real = day20+5 = day25.
-        # test_raw starts at day25. Purge: day25 < day25 is False -> no test rows purged.
+        """When all val rows are purged, splitter raises ValueError."""
+        # horizon=5, 30 rows: all 4 val rows purged -> ValueError
         m = self._make_matrix_with_horizon(30, horizon=5)
         cfg = SplitConfig(train_fraction=0.70, val_fraction=0.15, test_fraction=0.15)
-        result = splitter.split(m, cfg)
-        assert result.val_size == 0
-        assert result.val_rows_purged == 4
-        # test fallback: boundary = last train row, real=day25, test starts at day25
-        # day25 < day25 is False -> 0 purged
-        assert result.test_rows_purged == 0
+        with pytest.raises(ValueError, match="validation split"):
+            splitter.split(m, cfg)
 
     def test_purge_with_calendar_weekend_and_holiday_gaps(self, splitter: DatasetSplitter) -> None:
         """Purging across non-contiguous observation dates (weekend and holiday gaps).
@@ -576,6 +618,142 @@ class TestDatasetSplitterPurge:
         assert result.boundary.last_val_observation_date == date(2024, 1, 12)
         assert result.boundary.first_test_observation_date == date(2024, 1, 17)
 
+    def test_purge_uses_max_realization_date_not_last(self, splitter: DatasetSplitter) -> None:
+        """Purging must use max realization_date across prior split, not merely the last row's."""
+        rows = (
+            # Train (2 rows): Row 0 has real=Jan 10, Row 1 has real=Jan 5 (non-monotonic)
+            _make_row(obs_date=date(2024, 1, 2), realization_date=date(2024, 1, 10)),
+            _make_row(obs_date=date(2024, 1, 3), realization_date=date(2024, 1, 5)),
+            # Val (2 rows): Row 2 obs=Jan 6 (< max train real Jan 10 -> MUST BE PURGED)
+            # Row 3 obs=Jan 11 (>= max train real Jan 10 -> KEPT)
+            _make_row(obs_date=date(2024, 1, 6), realization_date=date(2024, 1, 12)),
+            _make_row(obs_date=date(2024, 1, 11), realization_date=date(2024, 1, 15)),
+            # Test (2 rows)
+            _make_row(obs_date=date(2024, 1, 16), realization_date=date(2024, 1, 20)),
+            _make_row(obs_date=date(2024, 1, 21), realization_date=date(2024, 1, 25)),
+        )
+        matrix = FeatureMatrix(
+            instrument_id=_INST_ID,
+            feature_names=("sma_window_5",),
+            feature_definitions=(_make_feature_def(),),
+            target_definition=_make_target_def(horizon=2),
+            rows=rows,
+        )
+        # 6 rows: 1/3, 1/3, 1/3 -> train=2, val=2, test=2
+        cfg = SplitConfig(
+            train_fraction=1.0 / 3.0,
+            val_fraction=1.0 / 3.0,
+            test_fraction=1.0 / 3.0,
+            purge_overlap=True,
+            embargo_bars=0,
+        )
+        result = splitter.split(matrix, cfg)
+        # Row 2 (Jan 6) MUST be purged because Jan 6 < max(Jan 10, Jan 5) = Jan 10.
+        # Under buggy code using train[-1].real (Jan 5), Jan 6 < Jan 5 is False, so 0 rows are purged.
+        assert result.val_rows_purged == 1
+        assert result.val_size == 1
+        assert result.val_rows[0].observation_date == date(2024, 1, 11)
+
+    def test_both_boundaries_short_val_train_cannot_overlap_test(
+        self, splitter: DatasetSplitter
+    ) -> None:
+        """Confirm purging and embargo run at both train->val and val->test boundaries."""
+        rows = (
+            # Train (2 rows): max realization date is Jan 10
+            _make_row(obs_date=date(2024, 1, 2), realization_date=date(2024, 1, 8)),
+            _make_row(obs_date=date(2024, 1, 3), realization_date=date(2024, 1, 10)),
+            # Val (2 rows): Short validation split. Starts at Jan 10 (kept). Realizations end Jan 18.
+            _make_row(obs_date=date(2024, 1, 10), realization_date=date(2024, 1, 16)),
+            _make_row(obs_date=date(2024, 1, 11), realization_date=date(2024, 1, 18)),
+            # Test (4 rows):
+            # Row 4 obs=Jan 12 (< max val real Jan 18 -> PURGED)
+            # Row 5 obs=Jan 15 (< max val real Jan 18 -> PURGED)
+            # Row 6 obs=Jan 18 (== max val real Jan 18 -> KEPT)
+            # Row 7 obs=Jan 19 (> max val real Jan 18 -> KEPT)
+            _make_row(obs_date=date(2024, 1, 12), realization_date=date(2024, 1, 22)),
+            _make_row(obs_date=date(2024, 1, 15), realization_date=date(2024, 1, 24)),
+            _make_row(obs_date=date(2024, 1, 18), realization_date=date(2024, 1, 26)),
+            _make_row(obs_date=date(2024, 1, 19), realization_date=date(2024, 1, 28)),
+        )
+        matrix = FeatureMatrix(
+            instrument_id=_INST_ID,
+            feature_names=("sma_window_5",),
+            feature_definitions=(_make_feature_def(),),
+            target_definition=_make_target_def(horizon=2),
+            rows=rows,
+        )
+        # 8 rows: 2 train (0.25), 2 val (0.25), 4 test (0.50)
+        cfg = SplitConfig(
+            train_fraction=0.25,
+            val_fraction=0.25,
+            test_fraction=0.50,
+            purge_overlap=True,
+            embargo_bars=0,
+        )
+        result = splitter.split(matrix, cfg)
+
+        # Train -> Val boundary
+        assert result.train_size == 2
+        assert result.val_rows_purged == 0
+        assert result.val_size == 2
+
+        # Val -> Test boundary
+        assert result.test_rows_purged == 2
+        assert result.test_size == 2
+        assert tuple(r.observation_date for r in result.test_rows) == (
+            date(2024, 1, 18),
+            date(2024, 1, 19),
+        )
+
+        # Verification: No train or val target intervals overlap with test rows
+        max_train_realization = max(r.realization_date for r in result.train_rows)
+        max_val_realization = max(r.realization_date for r in result.val_rows)
+        for test_row in result.test_rows:
+            assert test_row.observation_date >= max_train_realization
+            assert test_row.observation_date >= max_val_realization
+
+    def test_purge_equality_boundary_is_kept(self, splitter: DatasetSplitter) -> None:
+        """Equality pin: row.observation_date == max_prior_realization_date must be KEPT.
+
+        Convention: Target interval (observation_date, realization_date] is half-open.
+        A row observed on date D does not overlap with a prior target interval
+        ending on date D because the prior return was realized at close of D,
+        and the new row's forward return is earned over bars strictly after D.
+        Strict inequality '<' is required; '<=' would incorrectly purge this row.
+        """
+        rows = (
+            # Train (2 rows): max realization date is Jan 5
+            _make_row(obs_date=date(2024, 1, 2), realization_date=date(2024, 1, 5)),
+            _make_row(obs_date=date(2024, 1, 3), realization_date=date(2024, 1, 5)),
+            # Val (2 rows): First row is observed ON Jan 5 (boundary equality)
+            _make_row(obs_date=date(2024, 1, 5), realization_date=date(2024, 1, 10)),
+            _make_row(obs_date=date(2024, 1, 6), realization_date=date(2024, 1, 11)),
+            # Test (2 rows): First test row is observed ON Jan 11 (boundary equality with val max real)
+            _make_row(obs_date=date(2024, 1, 11), realization_date=date(2024, 1, 15)),
+            _make_row(obs_date=date(2024, 1, 12), realization_date=date(2024, 1, 16)),
+        )
+        matrix = FeatureMatrix(
+            instrument_id=_INST_ID,
+            feature_names=("sma_window_5",),
+            feature_definitions=(_make_feature_def(),),
+            target_definition=_make_target_def(horizon=2),
+            rows=rows,
+        )
+        cfg = SplitConfig(
+            train_fraction=1.0 / 3.0,
+            val_fraction=1.0 / 3.0,
+            test_fraction=1.0 / 3.0,
+            purge_overlap=True,
+            embargo_bars=0,
+        )
+        result = splitter.split(matrix, cfg)
+        # Jan 5 row in val must be kept (not purged)
+        assert result.val_rows_purged == 0
+        assert result.val_rows[0].observation_date == date(2024, 1, 5)
+        # Jan 11 row in test must be kept (not purged)
+        assert result.test_rows_purged == 0
+        assert result.test_rows[0].observation_date == date(2024, 1, 11)
+
 
 # ===========================================================================
 # DatasetSplitter - embargo tests
@@ -615,10 +793,10 @@ class TestDatasetSplitterEmbargo:
         assert result.val_rows_embargoed == 0
         assert result.test_rows_embargoed == 0
 
-    def test_embargo_larger_than_segment_clamps_to_segment_size(
+    def test_embargo_larger_than_segment_raises_value_error(
         self, splitter: DatasetSplitter
     ) -> None:
-        # embargo=100 > val_size=3, should remove all 3 val rows.
+        # embargo=100 > val_size=3, empties val split -> raises ValueError
         m = _make_matrix(20, horizon=1)
         cfg = SplitConfig(
             train_fraction=0.70,
@@ -626,9 +804,8 @@ class TestDatasetSplitterEmbargo:
             test_fraction=0.15,
             embargo_bars=100,
         )
-        result = splitter.split(m, cfg)
-        assert result.val_rows_embargoed == 3  # clamped to raw val segment size
-        assert result.val_size == 0
+        with pytest.raises(ValueError, match="validation split"):
+            splitter.split(m, cfg)
 
     def test_embargo_not_double_counted_with_purge(self, splitter: DatasetSplitter) -> None:
         # horizon=3, 30 rows: val_raw=4, 2 purged.
@@ -649,6 +826,49 @@ class TestDatasetSplitterEmbargo:
         # Total val accounted for: 2+1+1 = 4 = val_raw_size
         raw_val_size = 4  # floor(0.15*30)
         assert result.val_rows_purged + result.val_rows_embargoed + result.val_size == raw_val_size
+
+    def test_embargo_counts_bars_not_calendar_days(self, splitter: DatasetSplitter) -> None:
+        """Embargo must count row positions (bars), ignoring calendar day distances."""
+        # Irregular observation dates with large calendar gaps (weekends, holidays):
+        rows = (
+            _make_row(obs_date=date(2024, 1, 2), realization_date=date(2024, 1, 3)),
+            _make_row(obs_date=date(2024, 1, 3), realization_date=date(2024, 1, 4)),
+            # Val segment has 3 rows with large calendar gaps (10 days, 21 days):
+            _make_row(obs_date=date(2024, 1, 5), realization_date=date(2024, 1, 6)),  # Bar 0 of val
+            _make_row(
+                obs_date=date(2024, 1, 15), realization_date=date(2024, 1, 16)
+            ),  # Bar 1 of val (10 days later)
+            _make_row(
+                obs_date=date(2024, 2, 5), realization_date=date(2024, 2, 6)
+            ),  # Bar 2 of val (21 days later)
+            # Test segment has 3 rows:
+            _make_row(obs_date=date(2024, 2, 10), realization_date=date(2024, 2, 11)),
+            _make_row(obs_date=date(2024, 2, 20), realization_date=date(2024, 2, 21)),
+            _make_row(obs_date=date(2024, 3, 1), realization_date=date(2024, 3, 2)),
+        )
+        matrix = FeatureMatrix(
+            instrument_id=_INST_ID,
+            feature_names=("sma_window_5",),
+            feature_definitions=(_make_feature_def(),),
+            target_definition=_make_target_def(horizon=1),
+            rows=rows,
+        )
+        # 8 rows: 2 train (0.25), 3 val (0.375), 3 test (0.375)
+        cfg = SplitConfig(
+            train_fraction=0.25,
+            val_fraction=0.375,
+            test_fraction=0.375,
+            purge_overlap=False,
+            embargo_bars=2,  # Exactly 2 bars removed, regardless of calendar days
+        )
+        result = splitter.split(matrix, cfg)
+        assert result.val_rows_embargoed == 2
+        assert result.val_size == 1
+        # The single retained val row must be the 3rd bar (2024-02-05)
+        assert result.val_rows[0].observation_date == date(2024, 2, 5)
+        assert result.test_rows_embargoed == 2
+        assert result.test_size == 1
+        assert result.test_rows[0].observation_date == date(2024, 3, 1)
 
 
 # ===========================================================================
@@ -677,6 +897,51 @@ class TestSplitResult:
         cfg = SplitConfig(train_fraction=0.70, val_fraction=0.15, test_fraction=0.15)
         result = splitter.split(m, cfg)
         assert result.retained_rows + result.total_removed_rows == result.total_rows
+
+    def test_removal_counts_reconcile_across_diverse_scenarios(
+        self, splitter: DatasetSplitter
+    ) -> None:
+        """retained_rows + total_removed_rows must equal total_rows in every scenario."""
+        scenarios = [
+            (30, 1, 0, True),
+            (30, 2, 1, True),
+            (40, 3, 1, True),
+            (50, 1, 2, False),
+            (60, 4, 1, True),
+        ]
+        for n, horizon, embargo, purge in scenarios:
+            m = _make_matrix(n, horizon=horizon)
+            cfg = SplitConfig(
+                train_fraction=0.60,
+                val_fraction=0.20,
+                test_fraction=0.20,
+                purge_overlap=purge,
+                embargo_bars=embargo,
+            )
+            result = splitter.split(m, cfg)
+            assert result.total_rows == n
+            assert result.retained_rows + result.total_removed_rows == n
+            assert result.train_size == len(result.train_rows)
+            assert result.val_size == len(result.val_rows)
+            assert result.test_size == len(result.test_rows)
+            assert result.retained_rows == result.train_size + result.val_size + result.test_size
+            assert (
+                result.total_removed_rows
+                == result.val_rows_purged
+                + result.val_rows_embargoed
+                + result.test_rows_purged
+                + result.test_rows_embargoed
+            )
+            # Boundary dates match retained splits
+            assert (
+                result.boundary.last_train_observation_date
+                == result.train_rows[-1].observation_date
+            )
+            assert result.boundary.first_val_observation_date == result.val_rows[0].observation_date
+            assert result.boundary.last_val_observation_date == result.val_rows[-1].observation_date
+            assert (
+                result.boundary.first_test_observation_date == result.test_rows[0].observation_date
+            )
 
     def test_boundary_dates_are_correct(self, splitter: DatasetSplitter) -> None:
         m = _make_matrix(20, horizon=1)
@@ -711,14 +976,16 @@ class TestSplitResult:
 
 
 class TestSplitBoundary:
-    def test_boundary_none_dates_when_split_empty(self, splitter: DatasetSplitter) -> None:
-        # All val rows purged -> first/last_val_observation_date is None.
-        m = _make_matrix(30, horizon=5)
-        cfg = SplitConfig(train_fraction=0.70, val_fraction=0.15, test_fraction=0.15)
-        result = splitter.split(m, cfg)
-        assert result.val_size == 0
-        assert result.boundary.first_val_observation_date is None
-        assert result.boundary.last_val_observation_date is None
+    def test_boundary_none_dates_when_split_empty(self) -> None:
+        boundary = SplitBoundary(
+            last_train_observation_date=date(2024, 1, 1),
+            first_val_observation_date=None,
+            last_val_observation_date=None,
+            first_test_observation_date=None,
+        )
+        assert boundary.first_val_observation_date is None
+        assert boundary.last_val_observation_date is None
+        assert boundary.first_test_observation_date is None
 
     def test_boundary_dates_present_when_splits_not_empty(self, splitter: DatasetSplitter) -> None:
         m = _make_matrix(20, horizon=1)
@@ -805,11 +1072,8 @@ class TestDatasetSplitterEdgeCases:
             purge_overlap=False,
             embargo_bars=999,
         )
-        result = splitter.split(m, cfg)
-        assert result.val_size == 0
-        assert result.test_size == 0
-        assert result.val_rows_embargoed == 3  # floor(0.15*20) = 3
-        assert result.test_rows_embargoed == 3
+        with pytest.raises(ValueError, match="validation split"):
+            splitter.split(m, cfg)
 
     def test_result_row_types_are_datasetrow(self, splitter: DatasetSplitter) -> None:
         m = _make_matrix(20, horizon=1)
@@ -835,3 +1099,13 @@ class TestDatasetSplitterEdgeCases:
         cfg = SplitConfig(train_fraction=0.70, val_fraction=0.15, test_fraction=0.15)
         result = splitter.split(m, cfg)
         assert result.total_rows == len(m)
+
+    def test_purge_or_embargo_consuming_entire_split_raises_value_error(
+        self, splitter: DatasetSplitter
+    ) -> None:
+        """Purging + embargo consuming an entire split must raise a clear exception."""
+        # 30 rows, horizon=5 -> all 4 val rows are purged
+        m = _make_matrix(30, horizon=5)
+        cfg = SplitConfig.default()
+        with pytest.raises(ValueError, match="validation split"):
+            splitter.split(m, cfg)
