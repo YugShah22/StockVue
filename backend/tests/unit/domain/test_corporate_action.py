@@ -77,6 +77,71 @@ class TestCorporateActionEntity:
                 value=Decimal("-5.0"),
             )
 
+    def test_infinite_value_raises(self) -> None:
+        inst_id = uuid4()
+        with pytest.raises(ValueError, match="finite"):
+            CorporateAction(
+                instrument_id=inst_id,
+                action_type=CorporateActionType.SPLIT,
+                execution_date=date(2026, 6, 1),
+                value=Decimal("Inf"),
+            )
+
+        with pytest.raises(ValueError, match="finite"):
+            CorporateAction(
+                instrument_id=inst_id,
+                action_type=CorporateActionType.SPLIT,
+                execution_date=date(2026, 6, 1),
+                value=Decimal("-Inf"),
+            )
+
+    def test_nan_value_raises(self) -> None:
+        inst_id = uuid4()
+        with pytest.raises(ValueError, match="finite"):
+            CorporateAction(
+                instrument_id=inst_id,
+                action_type=CorporateActionType.SPLIT,
+                execution_date=date(2026, 6, 1),
+                value=Decimal("NaN"),
+            )
+
+    def test_non_decimal_value_raises(self) -> None:
+        inst_id = uuid4()
+        with pytest.raises(TypeError, match="Decimal"):
+            CorporateAction(
+                instrument_id=inst_id,
+                action_type=CorporateActionType.SPLIT,
+                execution_date=date(2026, 6, 1),
+                value=2.0,  # type: ignore[arg-type]
+            )
+
+        with pytest.raises(TypeError, match="Decimal"):
+            CorporateAction(
+                instrument_id=inst_id,
+                action_type=CorporateActionType.SPLIT,
+                execution_date=date(2026, 6, 1),
+                value=2,  # type: ignore[arg-type]
+            )
+
+        with pytest.raises(TypeError, match="Decimal"):
+            CorporateAction(
+                instrument_id=inst_id,
+                action_type=CorporateActionType.SPLIT,
+                execution_date=date(2026, 6, 1),
+                value="2.0",  # type: ignore[arg-type]
+            )
+
+    def test_valid_reverse_split_creation(self) -> None:
+        inst_id = uuid4()
+        action = CorporateAction(
+            instrument_id=inst_id,
+            action_type=CorporateActionType.SPLIT,
+            execution_date=date(2026, 6, 1),
+            value=Decimal("0.5"),
+            description="1:2 Reverse Split",
+        )
+        assert action.value == Decimal("0.5")
+
     def test_empty_currency_raises(self) -> None:
         inst_id = uuid4()
         with pytest.raises(ValueError, match="Currency cannot be empty string"):

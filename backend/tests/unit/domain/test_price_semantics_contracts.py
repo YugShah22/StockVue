@@ -99,6 +99,7 @@ from app.domain.prediction.calculators.forward_return_calculator import (
 )
 from app.domain.prediction.target_definition import TargetDefinition
 from app.domain.prediction.target_value import TargetValue
+from app.domain.services.adjusted_price_service import AdjustedPriceService
 from app.services.features.feature_calculator_registry import FeatureCalculatorRegistry
 from app.services.features.feature_engine import FeatureEngine
 from app.services.prediction.dataset_builder import DatasetBuilder
@@ -1206,7 +1207,6 @@ class TestCAdjAcceptanceSpecs:
         )
         _ = dividend
 
-    @acceptance_spec
     def test_C_ADJ_c_all_ohlc_fields_use_consistent_split_factor(self) -> None:
         """C_ADJ_c: All four OHLC fields are adjusted by the same split factor.
 
@@ -1219,11 +1219,9 @@ class TestCAdjAcceptanceSpecs:
             adj_low = 95/2 = 47.5, adj_close = 105/2 = 52.5
 
         The high/low ratio and open/close relationship must be preserved.
-
-        PREREQUISITE: AdjustedPriceService.
         """
         inst_id = uuid4()
-        CorporateAction(
+        split = CorporateAction(
             instrument_id=inst_id,
             action_type=CorporateActionType.SPLIT,
             execution_date=date(2026, 1, 6),
@@ -1239,16 +1237,19 @@ class TestCAdjAcceptanceSpecs:
             volume=Decimal("1000"),
         )
 
-        # TODO (Phase 5.4.2): call AdjustedPriceService.adjust(bars, corporate_actions)
-        # The returned bar for t0 must satisfy all of the following:
-        raise NotImplementedError(
-            "Acceptance spec: AdjustedPriceService not yet implemented. "
-            "Expected: adj_t0.open=50, adj_t0.high=55, adj_t0.low=47.5, "
-            "adj_t0.close=52.5. All OHLC fields divided by split factor (2)."
-        )
-        _ = bar_t0
+        service = AdjustedPriceService()
+        result = service.adjust([bar_t0], [split])
 
-    @acceptance_spec
+        assert len(result) == 1
+        adj_t0 = result[0]
+        assert adj_t0.open == Decimal("50")
+        assert adj_t0.high == Decimal("55")
+        assert adj_t0.low == Decimal("47.5")
+        assert adj_t0.close == Decimal("52.5")
+        assert adj_t0.volume == Decimal("2000")
+        assert adj_t0.low <= adj_t0.open <= adj_t0.high
+        assert adj_t0.low <= adj_t0.close <= adj_t0.high
+
     def test_C_ADJ_d_volume_uses_inverse_split_factor(self) -> None:
         """C_ADJ_d: Volume adjustment uses the INVERSE factor to price adjustment.
 
@@ -1259,16 +1260,36 @@ class TestCAdjAcceptanceSpecs:
 
         Convention: adj_volume = raw_volume x split_ratio
         This is the OPPOSITE direction from price adjustment.
-
-        PREREQUISITE: AdjustedPriceService with explicit volume convention.
         """
-        raise NotImplementedError(
-            "Acceptance spec: AdjustedPriceService not yet implemented. "
-            "Volume adjustment convention: adj_volume = raw_volume x split_ratio. "
-            "For a 2-for-1 split: 1000 shares → 2000 adjusted shares."
+        inst_id = uuid4()
+        split = CorporateAction(
+            instrument_id=inst_id,
+            action_type=CorporateActionType.SPLIT,
+            execution_date=date(2026, 1, 6),
+            value=Decimal("2"),
+        )
+        bar_t0 = _make_bar(
+            datetime(2026, 1, 5, 10, tzinfo=UTC),
+            Decimal("100"),
+            instrument_id=inst_id,
         )
 
-    @acceptance_spec
+        service = AdjustedPriceService()
+        result = service.adjust([bar_t0], [split])
+
+        assert len(result) == 1
+        assert result[0].volume == Decimal("2000")
+
+        # Reverse split (1-for-2, ratio 0.5): 1000 -> 500
+        rev_split = CorporateAction(
+            instrument_id=inst_id,
+            action_type=CorporateActionType.SPLIT,
+            execution_date=date(2026, 1, 6),
+            value=Decimal("0.5"),
+        )
+        rev_result = service.adjust([bar_t0], [rev_split])
+        assert rev_result[0].volume == Decimal("500")
+
     def test_C_ADJ_e_future_corporate_action_does_not_affect_past_features(
         self,
     ) -> None:
@@ -1284,14 +1305,41 @@ class TestCAdjAcceptanceSpecs:
         This is the point-in-time isolation guarantee applied to adjusted prices:
         at obs_date, only corporate actions BEFORE obs_date affect the
         back-adjusted prices used in features.
-
-        PREREQUISITE: AdjustedPriceService with point-in-time filtering.
         """
-        raise NotImplementedError(
-            "Acceptance spec: AdjustedPriceService not yet implemented. "
-            "The adjustment engine must only use corporate actions with "
-            "execution_date <= obs_date when computing point-in-time features."
+        inst_id = uuid4()
+        obs_date = date(2026, 1, 5)
+        bar_t0 = _make_bar(
+            datetime(2026, 1, 5, 10, tzinfo=UTC),
+            Decimal("200"),
+            instrument_id=inst_id,
         )
+        future_split = CorporateAction(
+            instrument_id=inst_id,
+            action_type=CorporateActionType.SPLIT,
+            execution_date=date(2026, 1, 20),
+            value=Decimal("2"),
+        )
+        service = AdjustedPriceService()
+
+        # View as of obs_date (2026-01-05): future split at 2026-01-20 is NOT effective
+        pit_result = service.adjust([bar_t0], [future_split], as_of_date=obs_date)
+        assert len(pit_result) == 1
+        assert pit_result[0].close == Decimal("200")
+
+        # View as of split date (2026-01-20): split IS effective and back-adjusts t0
+        post_result = service.adjust([bar_t0], [future_split], as_of_date=date(2026, 1, 20))
+        assert len(post_result) == 1
+        assert post_result[0].close == Decimal("100")
+
+        # View as of obs_date (2026-01-05): future split at 2026-01-20 is NOT effective
+        pit_result = service.adjust([bar_t0], [future_split], as_of_date=obs_date)
+        assert len(pit_result) == 1
+        assert pit_result[0].close == Decimal("200")
+
+        # View as of split date (2026-01-20): split IS effective and back-adjusts t0
+        post_result = service.adjust([bar_t0], [future_split], as_of_date=date(2026, 1, 20))
+        assert len(post_result) == 1
+        assert post_result[0].close == Decimal("100")
 
     @acceptance_spec
     def test_C_ADJ_f_corporate_action_inside_horizon_affects_total_return_target(
@@ -1315,52 +1363,45 @@ class TestCAdjAcceptanceSpecs:
             "included in the total-return target via the reinvestment formula."
         )
 
-    @acceptance_spec
     def test_C_ADJ_g_raw_market_bar_values_unchanged_after_adjustment(self) -> None:
         """C_ADJ_g: Raw MarketBar values are NOT mutated by the adjustment service.
 
         The AdjustedPriceService must return NEW MarketBar objects (or a separate
         adjusted representation) rather than modifying the input bars in place.
-
-        PREREQUISITE: AdjustedPriceService returns a copy/new type.
         """
         inst_id = uuid4()
         raw_bar = _make_bar(_BASE, Decimal("200"), instrument_id=inst_id)
         original_close = raw_bar.close
 
-        CorporateAction(
+        split = CorporateAction(
             instrument_id=inst_id,
             action_type=CorporateActionType.SPLIT,
             execution_date=(_BASE + timedelta(days=1)).date(),
             value=Decimal("2"),
         )
 
-        # TODO (Phase 5.4.2): call AdjustedPriceService.adjust([raw_bar], [split])
-        # After the call, raw_bar.close must still be 200.
-        raise NotImplementedError(
-            "Acceptance spec: AdjustedPriceService not yet implemented. "
-            "After adjustment, raw_bar.close must still be 200 (unchanged). "
-            f"Current raw_bar.close = {original_close}."
-        )
+        service = AdjustedPriceService()
+        result = service.adjust([raw_bar], [split])
 
-    @acceptance_spec
+        assert len(result) == 1
+        adj_bar = result[0]
+        # Raw bar is completely unmutated
+        assert raw_bar.close == original_close == Decimal("200")
+        assert adj_bar.close == Decimal("100")
+        assert adj_bar is not raw_bar
+
     def test_C_ADJ_h_invalid_corporate_action_values_are_rejected(self) -> None:
         """C_ADJ_h: Invalid corporate-action values are rejected at domain construction.
 
         Domain policy: CorporateAction.value must be a finite, strictly positive Decimal.
 
         The following MUST be rejected:
-        - Zero value (currently enforced: 'strictly positive')
-        - Negative value (currently enforced: 'strictly positive')
-        - NaN (rejected via ArithmeticError during Decimal comparison)
-        - Infinite values (+Inf, -Inf) (MUST be rejected; currently +Inf is NOT
-          rejected because '+Inf <= 0' evaluates to False, allowing +Inf to slip
-          through without domain validation).
-
-        Phase 5.4.2 prerequisite: Add explicit `if not self.value.is_finite():`
-        validation to CorporateAction.__post_init__.
+        - Zero value (enforced: 'strictly positive')
+        - Negative value (enforced: 'strictly positive')
+        - NaN (rejected via finite check)
+        - Infinite values (+Inf, -Inf) (rejected via finite check).
         """
-        # Zero rejected (enforced today)
+        # Zero rejected
         with pytest.raises(ValueError, match="strictly positive"):
             CorporateAction(
                 instrument_id=uuid4(),
@@ -1369,7 +1410,7 @@ class TestCAdjAcceptanceSpecs:
                 value=Decimal("0"),
             )
 
-        # Negative rejected (enforced today)
+        # Negative rejected
         with pytest.raises(ValueError, match="strictly positive"):
             CorporateAction(
                 instrument_id=uuid4(),
@@ -1378,7 +1419,7 @@ class TestCAdjAcceptanceSpecs:
                 value=Decimal("-2"),
             )
 
-        # NaN rejected (enforced today via InvalidOperation)
+        # NaN rejected
         with pytest.raises((ValueError, ArithmeticError)):
             CorporateAction(
                 instrument_id=uuid4(),
@@ -1387,7 +1428,7 @@ class TestCAdjAcceptanceSpecs:
                 value=Decimal("NaN"),
             )
 
-        # -Infinity rejected (enforced today via <= 0)
+        # -Infinity rejected
         with pytest.raises((ValueError, ArithmeticError)):
             CorporateAction(
                 instrument_id=uuid4(),
@@ -1396,7 +1437,7 @@ class TestCAdjAcceptanceSpecs:
                 value=Decimal("-Inf"),
             )
 
-        # +Infinity MUST be rejected (Phase 5.4.2 acceptance criterion: currently slips through)
+        # +Infinity rejected
         with pytest.raises((ValueError, ArithmeticError)):
             CorporateAction(
                 instrument_id=uuid4(),
