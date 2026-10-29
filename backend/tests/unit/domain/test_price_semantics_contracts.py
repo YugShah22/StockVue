@@ -97,6 +97,9 @@ from app.domain.features.feature_value import FeatureValue
 from app.domain.prediction.calculators.forward_return_calculator import (
     ForwardReturnCalculator,
 )
+from app.domain.prediction.calculators.total_return_calculator import (
+    TotalReturnCalculator,
+)
 from app.domain.prediction.target_definition import TargetDefinition
 from app.domain.prediction.target_value import TargetValue
 from app.domain.services.adjusted_price_service import AdjustedPriceService
@@ -1096,7 +1099,6 @@ class TestCAdjAcceptanceSpecs:
     - Corporate actions outside a target horizon must not affect observation features.
     """
 
-    @acceptance_spec
     def test_C_ADJ_a_split_does_not_create_false_loss(self) -> None:
         """C_ADJ_a: A 2-for-1 split must not produce a false 50% price loss.
 
@@ -1113,9 +1115,6 @@ class TestCAdjAcceptanceSpecs:
         Adjusted return = 100/100 - 1 = 0.00  (CORRECT: no economic change)
 
         The adjustment engine must produce 0.00, not -0.50.
-
-        PREREQUISITE: AdjustedPriceService must exist and be wired into
-        the forward-return calculation path.
         """
         inst_id = uuid4()
         split = CorporateAction(
@@ -1131,9 +1130,7 @@ class TestCAdjAcceptanceSpecs:
             ),  # t1 post-split
         ]
 
-        # TODO (Phase 5.4.2): replace with AdjustedForwardReturnCalculator or
-        # adjust bars via AdjustedPriceService before calling the calculator.
-        calc = ForwardReturnCalculator()
+        calc = TotalReturnCalculator(corporate_actions=[split])
         defn = _make_target_defn(horizon=1)
         result = calc.calculate(defn, inst_id, bars, bars[0].timestamp.date())
 
@@ -1147,9 +1144,7 @@ class TestCAdjAcceptanceSpecs:
         assert result.value != Decimal("-0.5"), (
             "Raw -0.50 return must not appear after split adjustment."
         )
-        _ = split  # referenced to confirm it is passed to the adjusted calculator
 
-    @acceptance_spec
     def test_C_ADJ_b_dividend_converts_price_return_to_total_return(self) -> None:
         """C_ADJ_b: Cash dividend distinguishes price return from total return.
 
@@ -1169,9 +1164,6 @@ class TestCAdjAcceptanceSpecs:
         More precisely, using the reinvestment factor:
             total_return = (t2_adj_close / t0_close) - 1
         where t2_adj_close accounts for reinvested shares.
-
-        PREREQUISITE: TotalReturnCalculator must exist with an explicit
-        dividend reinvestment convention (reinvest at ex-div close).
         """
         inst_id = uuid4()
         dividend = CorporateAction(
@@ -1189,8 +1181,7 @@ class TestCAdjAcceptanceSpecs:
             ),  # t2 realization
         ]
 
-        # TODO (Phase 5.4.2): call TotalReturnCalculator(corporate_actions=[dividend])
-        calc = ForwardReturnCalculator()
+        calc = TotalReturnCalculator(corporate_actions=[dividend])
         defn = _make_target_defn(horizon=2)
         result = calc.calculate(defn, inst_id, bars, bars[0].timestamp.date())
 
@@ -1205,7 +1196,6 @@ class TestCAdjAcceptanceSpecs:
             f"got {result.value}. "
             "Reinvestment convention: reinvest at ex-dividend-date close."
         )
-        _ = dividend
 
     def test_C_ADJ_c_all_ohlc_fields_use_consistent_split_factor(self) -> None:
         """C_ADJ_c: All four OHLC fields are adjusted by the same split factor.
@@ -1341,27 +1331,62 @@ class TestCAdjAcceptanceSpecs:
         assert len(post_result) == 1
         assert post_result[0].close == Decimal("100")
 
-    @acceptance_spec
     def test_C_ADJ_f_corporate_action_inside_horizon_affects_total_return_target(
         self,
     ) -> None:
         """C_ADJ_f: A corporate action inside [obs_date, realization_date] affects total return.
 
         Scenario:
-            t0: obs_date
-            t2: dividend paid (inside the horizon)
-            t5: realization_date
+            t0: obs_date (2026-01-05), close = 100
+            t1: 2026-01-06, close = 100
+            t2: 2026-01-07, close = 95, dividend = 5.00 (inside horizon)
+            t3: 2026-01-08, close = 95
+            t4: 2026-01-09, close = 95
+            t5: 2026-01-12, close = 95 (realization date, horizon = 5)
 
         The total-return target must include the dividend income accumulated
-        between t0 and t5.  The price-return target need not.
+        between t0 and t5. The price-return target does not.
 
-        PREREQUISITE: TotalReturnCalculator that accepts corporate_actions.
+        Price return: 95 / 100 - 1 = -0.05 (-5% loss)
+        Total return: (95 / 100) * (1 + 5 / 95) - 1 = 0.00 (flat economic return)
         """
-        raise NotImplementedError(
-            "Acceptance spec: TotalReturnCalculator not yet implemented. "
-            "Dividends paid between obs_date and realization_date must be "
-            "included in the total-return target via the reinvestment formula."
+        inst_id = uuid4()
+        dividend = CorporateAction(
+            instrument_id=inst_id,
+            action_type=CorporateActionType.DIVIDEND,
+            execution_date=date(2026, 1, 7),
+            value=Decimal("5.00"),
+            currency="INR",
         )
+        bars = [
+            _make_bar(datetime(2026, 1, 5, 10, tzinfo=UTC), Decimal("100"), inst_id),
+            _make_bar(datetime(2026, 1, 6, 10, tzinfo=UTC), Decimal("100"), inst_id),
+            _make_bar(datetime(2026, 1, 7, 10, tzinfo=UTC), Decimal("95"), inst_id),
+            _make_bar(datetime(2026, 1, 8, 10, tzinfo=UTC), Decimal("95"), inst_id),
+            _make_bar(datetime(2026, 1, 9, 10, tzinfo=UTC), Decimal("95"), inst_id),
+            _make_bar(datetime(2026, 1, 12, 10, tzinfo=UTC), Decimal("95"), inst_id),
+        ]
+
+        # TotalReturnCalculator accounts for the dividend inside horizon
+        total_calc = TotalReturnCalculator(corporate_actions=[dividend])
+        defn_total = TargetDefinition(name="total_return", horizon_bars=5)
+        total_result = total_calc.calculate(defn_total, inst_id, bars, bars[0].timestamp.date())
+
+        assert total_result is not None
+        assert total_result.value == Decimal("0"), (
+            f"Total return must be 0.00 (dividend offsets price drop), got {total_result.value}."
+        )
+
+        # Raw ForwardReturnCalculator ignores corporate actions (price return only)
+        raw_calc = ForwardReturnCalculator()
+        defn_raw = TargetDefinition(name="forward_return", horizon_bars=5)
+        raw_result = raw_calc.calculate(defn_raw, inst_id, bars, bars[0].timestamp.date())
+
+        assert raw_result is not None
+        assert raw_result.value == Decimal("-0.05"), (
+            f"Raw price return must be -0.05, got {raw_result.value}."
+        )
+        assert total_result.value != raw_result.value
 
     def test_C_ADJ_g_raw_market_bar_values_unchanged_after_adjustment(self) -> None:
         """C_ADJ_g: Raw MarketBar values are NOT mutated by the adjustment service.

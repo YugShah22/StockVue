@@ -5,12 +5,21 @@ from decimal import Decimal
 from typing import Any, Final
 from uuid import UUID
 
+from app.domain.entities.corporate_action import CorporateAction
 from app.domain.entities.market_bar import MarketBar
 from app.domain.features.feature_calculation_context import FeatureCalculationContext
 from app.domain.features.feature_definition import FeatureDefinition
-from app.domain.prediction.calculators.forward_return_calculator import ForwardReturnCalculator
+from app.domain.prediction.calculators.forward_return_calculator import (
+    ForwardReturnCalculator,
+)
+from app.domain.prediction.calculators.total_return_calculator import (
+    TotalReturnCalculator,
+)
 from app.domain.prediction.dataset import DatasetRow, FeatureMatrix
 from app.domain.prediction.target_definition import TargetDefinition
+from app.domain.repositories.corporate_action_repository import (
+    CorporateActionRepository,
+)
 from app.services.features.feature_engine import FeatureEngine
 
 _SCALAR_RESERVED_WORDS: Final[frozenset[str]] = frozenset({"True", "False", "None"})
@@ -130,17 +139,20 @@ def generate_feature_name(definition: FeatureDefinition) -> str:
 class DatasetBuilder:
     """Constructs point-in-time machine-learning training datasets.
 
-    Coordinates FeatureEngine and ForwardReturnCalculator while guaranteeing:
+    Coordinates FeatureEngine, ForwardReturnCalculator, and TotalReturnCalculator while guaranteeing:
     1. Zero future-information leakage into feature calculations.
     2. Exact alignment between observation dates, realization dates, and labels.
     3. Complete, rectangular matrix output without missing or fabricated values.
     4. Deterministic feature column ordering.
+    5. Clean separation between forward_return (raw) and total_return (split/dividend adjusted) targets.
     """
 
     def __init__(
         self,
         feature_engine: FeatureEngine,
         target_calculator: ForwardReturnCalculator | None = None,
+        corporate_action_repository: CorporateActionRepository | None = None,
+        total_return_calculator: TotalReturnCalculator | None = None,
     ) -> None:
         if not isinstance(feature_engine, FeatureEngine):
             raise TypeError(
@@ -152,8 +164,24 @@ class DatasetBuilder:
             raise TypeError(
                 f"target_calculator must be a ForwardReturnCalculator instance, got {type(target_calculator).__name__}"
             )
+        if corporate_action_repository is not None and not isinstance(
+            corporate_action_repository, CorporateActionRepository
+        ):
+            raise TypeError(
+                f"corporate_action_repository must be a CorporateActionRepository instance, "
+                f"got {type(corporate_action_repository).__name__}"
+            )
+        if total_return_calculator is not None and not isinstance(
+            total_return_calculator, TotalReturnCalculator
+        ):
+            raise TypeError(
+                f"total_return_calculator must be a TotalReturnCalculator instance, "
+                f"got {type(total_return_calculator).__name__}"
+            )
         self._feature_engine = feature_engine
         self._target_calculator = target_calculator or ForwardReturnCalculator()
+        self._corporate_action_repository = corporate_action_repository
+        self._total_return_calculator = total_return_calculator or TotalReturnCalculator()
 
     @property
     def feature_engine(self) -> FeatureEngine:
@@ -163,6 +191,14 @@ class DatasetBuilder:
     def target_calculator(self) -> ForwardReturnCalculator:
         return self._target_calculator
 
+    @property
+    def corporate_action_repository(self) -> CorporateActionRepository | None:
+        return self._corporate_action_repository
+
+    @property
+    def total_return_calculator(self) -> TotalReturnCalculator:
+        return self._total_return_calculator
+
     def build_dataset(
         self,
         instrument_id: UUID,
@@ -170,6 +206,7 @@ class DatasetBuilder:
         features: Sequence[FeatureDefinition],
         target: TargetDefinition,
         observation_dates: Sequence[date] | None = None,
+        corporate_actions: Sequence[CorporateAction] | None = None,
     ) -> FeatureMatrix:
         """Construct a complete, point-in-time FeatureMatrix for an instrument.
 
@@ -182,10 +219,14 @@ class DatasetBuilder:
         features:
             Sequence of feature definitions. Preserves caller's column ordering.
         target:
-            The prediction target definition.
+            The prediction target definition (e.g. 'forward_return' or 'total_return').
         observation_dates:
             Optional sequence of observation dates to evaluate. If None, all
             eligible dates in the instrument's bars are evaluated.
+        corporate_actions:
+            Optional sequence of corporate actions for the target calculation.
+            If None and target is 'total_return', actions are retrieved from
+            corporate_action_repository. If neither is available, an error is raised.
 
         Returns
         -------
@@ -218,7 +259,54 @@ class DatasetBuilder:
             if not isinstance(b, MarketBar):
                 raise TypeError(f"bars[{i}] must be a MarketBar instance, got {type(b).__name__}")
 
-        # 2. Generate deterministic column names & detect collisions
+        if corporate_actions is not None:
+            if not isinstance(corporate_actions, Sequence) or isinstance(
+                corporate_actions, (str, bytes)
+            ):
+                raise TypeError("corporate_actions must be a sequence of CorporateAction")
+            for i, a in enumerate(corporate_actions):
+                if not isinstance(a, CorporateAction):
+                    raise TypeError(
+                        f"corporate_actions[{i}] must be a CorporateAction instance, got {type(a).__name__}"
+                    )
+
+        # 2. Filter bars by instrument_id and sort chronologically.
+        # Done early so that the end_date bound can be passed to the repository query below.
+        inst_bars = [b for b in bars if b.instrument_id == instrument_id]
+        sorted_bars = sorted(inst_bars, key=lambda b: b.timestamp)
+
+        # 3. Resolve corporate actions for total_return targets.
+        # When bars are available, bound the query to end_date=last_bar_date so that the
+        # database does not return corporate actions that can never affect any target row.
+        resolved_actions: list[CorporateAction] | None = None
+        if target.name == "total_return":
+            if corporate_actions is not None:
+                resolved_actions = [
+                    a for a in corporate_actions if a.instrument_id == instrument_id
+                ]
+            elif self._corporate_action_repository is not None:
+                if not sorted_bars:
+                    # When no bars exist for this instrument, avoid querying the repository entirely.
+                    # An empty dataset must not trigger an unbounded corporate-action lookup with end_date=None.
+                    resolved_actions = []
+                else:
+                    last_bar_date = sorted_bars[-1].timestamp.date()
+                    repo_actions = self._corporate_action_repository.get_by_instrument(
+                        instrument_id=instrument_id,
+                        end_date=last_bar_date,
+                    )
+                    if repo_actions is None:
+                        raise ValueError(
+                            f"CorporateActionRepository returned None for instrument {instrument_id}"
+                        )
+                    resolved_actions = [a for a in repo_actions if a.instrument_id == instrument_id]
+            else:
+                raise ValueError(
+                    "Target 'total_return' requires corporate actions: pass corporate_actions "
+                    "to build_dataset() or configure a corporate_action_repository on DatasetBuilder."
+                )
+
+        # 4. Generate deterministic column names & detect collisions
         feature_names: list[str] = []
         seen_names: set[str] = set()
         for defn in features:
@@ -230,7 +318,7 @@ class DatasetBuilder:
             seen_names.add(col_name)
             feature_names.append(col_name)
 
-        # 3. Validate observation_dates if provided
+        # 5. Validate observation_dates if provided
         req_dates: list[date] | None = None
         if observation_dates is not None:
             if not isinstance(observation_dates, Sequence) or isinstance(
@@ -249,11 +337,7 @@ class DatasetBuilder:
             if len(req_dates) != len(set(req_dates)):
                 raise ValueError("Duplicate observation dates requested")
 
-        # 4. Filter bars by instrument_id FIRST, then sort chronologically
-        inst_bars = [b for b in bars if b.instrument_id == instrument_id]
-        sorted_bars = sorted(inst_bars, key=lambda b: b.timestamp)
-
-        # 5. Check for duplicate observation dates for this instrument
+        # 6. Check for duplicate observation dates for this instrument
         bar_dates = [b.timestamp.date() for b in sorted_bars]
         if len(bar_dates) != len(set(bar_dates)):
             raise ValueError(
@@ -261,7 +345,7 @@ class DatasetBuilder:
                 f"Deduplicate the input bars before constructing a dataset."
             )
 
-        # 6. Determine candidate observation dates
+        # 7. Determine candidate observation dates
         if req_dates is None:
             candidate_dates = bar_dates
         else:
@@ -269,10 +353,10 @@ class DatasetBuilder:
             sorted_req_dates = sorted(req_dates)
             candidate_dates = [d for d in sorted_req_dates if d in bar_date_set]
 
-        # 7. Map calendar dates to chronological bar indices
+        # 8. Map calendar dates to chronological bar indices
         date_to_idx = {b.timestamp.date(): i for i, b in enumerate(sorted_bars)}
 
-        # 8. Point-in-time calculation loop
+        # 9. Point-in-time calculation loop
         rows: list[DatasetRow] = []
         dropped_incomplete_feature_count = 0
         dropped_incomplete_target_count = 0
@@ -303,12 +387,38 @@ class DatasetBuilder:
                 continue
 
             # Forward target calculation (future bars allowed strictly for label computation)
-            target_val = self._target_calculator.calculate(
-                definition=target,
-                instrument_id=instrument_id,
-                bars=sorted_bars,
-                observation_date=obs_date,
-            )
+            if target.name == "total_return":
+                h = target.horizon_bars
+                future_idx = obs_idx + h
+                if future_idx >= len(sorted_bars):
+                    dropped_incomplete_target_count += 1
+                    continue
+
+                realization_date = sorted_bars[future_idx].timestamp.date()
+                if realization_date <= obs_date:
+                    dropped_incomplete_target_count += 1
+                    continue
+
+                assert resolved_actions is not None
+                # Filter corporate actions strictly to (obs_date, realization_date]
+                horizon_actions = [
+                    a for a in resolved_actions if obs_date < a.execution_date <= realization_date
+                ]
+
+                target_val = self._total_return_calculator.calculate(
+                    definition=target,
+                    instrument_id=instrument_id,
+                    bars=sorted_bars,
+                    observation_date=obs_date,
+                    corporate_actions=horizon_actions,
+                )
+            else:
+                target_val = self._target_calculator.calculate(
+                    definition=target,
+                    instrument_id=instrument_id,
+                    bars=sorted_bars,
+                    observation_date=obs_date,
+                )
 
             if target_val is None or not target_val.value.is_finite():
                 dropped_incomplete_target_count += 1

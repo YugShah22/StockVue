@@ -1,17 +1,24 @@
+from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID, uuid4
 
 import pytest
 
+from app.domain.entities.corporate_action import CorporateAction
 from app.domain.entities.market_bar import MarketBar
+from app.domain.enums.corporate_action_type import CorporateActionType
 from app.domain.features.feature_category import FeatureCategory
 from app.domain.features.feature_definition import FeatureDefinition
 from app.domain.prediction.dataset import DatasetRow, FeatureMatrix
 from app.domain.prediction.target_definition import TargetDefinition
+from app.domain.repositories.corporate_action_repository import (
+    CorporateActionRepository,
+)
 from app.services.features.feature_calculator_registry import create_default_feature_registry
 from app.services.features.feature_engine import FeatureEngine
 from app.services.prediction.dataset_builder import DatasetBuilder, generate_feature_name
+from app.services.prediction.dataset_splitter import DatasetSplitter, SplitConfig
 
 # ===========================================================================
 # Helpers & Fixtures
@@ -1320,3 +1327,865 @@ class TestFeatureMatrixAndDatasetRowContract:
         )
         assert generate_feature_name(defn_k_int) == generate_feature_name(defn_k_dec)
         assert generate_feature_name(defn_k_int) == "bollinger_bands_band_upper_k_2_window_20"
+
+
+class InMemoryCorporateActionRepository(CorporateActionRepository):
+    """Simple in-memory repository for unit testing corporate action retrieval."""
+
+    def __init__(self, actions: Sequence[CorporateAction] = ()) -> None:
+        self.actions = list(actions)
+
+    def get_by_id(self, corporate_action_id: UUID) -> CorporateAction | None:
+        return next((a for a in self.actions if a.corporate_action_id == corporate_action_id), None)
+
+    def get_by_instrument(
+        self,
+        instrument_id: UUID,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        action_type: CorporateActionType | None = None,
+    ) -> list[CorporateAction]:
+        res = [a for a in self.actions if a.instrument_id == instrument_id]
+        if start_date is not None:
+            res = [a for a in res if a.execution_date >= start_date]
+        if end_date is not None:
+            res = [a for a in res if a.execution_date <= end_date]
+        if action_type is not None:
+            res = [a for a in res if a.action_type == action_type]
+        return res
+
+    def get_by_instrument_and_date(
+        self,
+        instrument_id: UUID,
+        execution_date: date,
+        action_type: CorporateActionType | None = None,
+    ) -> list[CorporateAction]:
+        res = [
+            a
+            for a in self.actions
+            if a.instrument_id == instrument_id and a.execution_date == execution_date
+        ]
+        if action_type is not None:
+            res = [a for a in res if a.action_type == action_type]
+        return res
+
+    def save(self, action: CorporateAction) -> None:
+        self.actions.append(action)
+
+
+class TestDatasetBuilderTotalReturnIntegration:
+    """Tests integration of TotalReturnCalculator and CorporateActionRepository into DatasetBuilder."""
+
+    def test_forward_return_behavior_remains_unchanged(self, engine: FeatureEngine) -> None:
+        """1. Existing forward_return targets retain raw price-return semantics."""
+        inst_id = uuid4()
+        closes = ["100", "200", "100"]  # t0=100, t1=200, t2=100
+        bars = make_daily_series(date(2026, 1, 5), closes, inst_id)
+
+        # Corporate actions in repo: a 2-for-1 split at t2
+        split = CorporateAction(
+            instrument_id=inst_id,
+            action_type=CorporateActionType.SPLIT,
+            execution_date=date(2026, 1, 7),
+            value=Decimal("2"),
+        )
+        repo = InMemoryCorporateActionRepository([split])
+
+        builder_with_repo = DatasetBuilder(feature_engine=engine, corporate_action_repository=repo)
+        builder_default = DatasetBuilder(feature_engine=engine)
+
+        features = [
+            FeatureDefinition(
+                name="return",
+                category=FeatureCategory.TECHNICAL,
+                description="1d return",
+                parameters={"window": 1},
+            )
+        ]
+        target = TargetDefinition(name="forward_return", horizon_bars=1)
+
+        matrix_repo = builder_with_repo.build_dataset(
+            instrument_id=inst_id, bars=bars, features=features, target=target
+        )
+        matrix_default = builder_default.build_dataset(
+            instrument_id=inst_id, bars=bars, features=features, target=target
+        )
+
+        # forward_return must completely ignore the corporate action and remain raw
+        # Row 0: obs=t1(200), real=t2(100) -> raw return = 100/200 - 1 = -0.50
+        assert len(matrix_repo) == 1
+        assert len(matrix_default) == 1
+        assert matrix_repo.target_vector[0] == Decimal("-0.5")
+        assert matrix_default.target_vector[0] == Decimal("-0.5")
+        assert matrix_repo.rows == matrix_default.rows
+
+    def test_total_return_target_selection_invokes_total_return_calculator(
+        self, engine: FeatureEngine
+    ) -> None:
+        """2. total_return target selection invokes TotalReturnCalculator."""
+        inst_id = uuid4()
+        bars = [
+            make_bar(datetime(2026, 1, 5, 10, tzinfo=UTC), Decimal("200"), inst_id),
+            make_bar(datetime(2026, 1, 6, 10, tzinfo=UTC), Decimal("100"), inst_id),
+        ]
+        split = CorporateAction(
+            instrument_id=inst_id,
+            action_type=CorporateActionType.SPLIT,
+            execution_date=date(2026, 1, 6),
+            value=Decimal("2"),
+        )
+        repo = InMemoryCorporateActionRepository([split])
+        builder = DatasetBuilder(feature_engine=engine, corporate_action_repository=repo)
+
+        features = [
+            FeatureDefinition(
+                name="sma",
+                category=FeatureCategory.TECHNICAL,
+                description="1d SMA",
+                parameters={"window": 1},
+            )
+        ]
+        target = TargetDefinition(name="total_return", horizon_bars=1)
+
+        matrix = builder.build_dataset(
+            instrument_id=inst_id, bars=bars, features=features, target=target
+        )
+
+        assert len(matrix) == 1
+        # Economic value unchanged: 2-for-1 split produces 0.00 total return, not -0.50
+        assert matrix.target_vector[0] == Decimal("0")
+
+    def test_corporate_actions_filtered_to_target_horizon(self, engine: FeatureEngine) -> None:
+        """3. Corporate actions are filtered strictly to (observation_date, realization_date]."""
+        inst_id = uuid4()
+        bars = [
+            make_bar(datetime(2026, 1, 5, 10, tzinfo=UTC), Decimal("100"), inst_id),  # t0
+            make_bar(datetime(2026, 1, 6, 10, tzinfo=UTC), Decimal("100"), inst_id),  # t1
+            make_bar(datetime(2026, 1, 7, 10, tzinfo=UTC), Decimal("95"), inst_id),  # t2
+        ]
+        # Action on t0 (excluded from (t0, t2])
+        div_t0 = CorporateAction(
+            instrument_id=inst_id,
+            action_type=CorporateActionType.DIVIDEND,
+            execution_date=date(2026, 1, 5),
+            value=Decimal("10.00"),
+        )
+        # Action on t2 (inside (t0, t2])
+        div_t2 = CorporateAction(
+            instrument_id=inst_id,
+            action_type=CorporateActionType.DIVIDEND,
+            execution_date=date(2026, 1, 7),
+            value=Decimal("5.00"),
+        )
+        repo = InMemoryCorporateActionRepository([div_t0, div_t2])
+        builder = DatasetBuilder(feature_engine=engine, corporate_action_repository=repo)
+
+        features = [
+            FeatureDefinition(
+                name="sma",
+                category=FeatureCategory.TECHNICAL,
+                description="1d SMA",
+                parameters={"window": 1},
+            )
+        ]
+        target = TargetDefinition(name="total_return", horizon_bars=2)
+
+        matrix = builder.build_dataset(
+            instrument_id=inst_id,
+            bars=bars,
+            features=features,
+            target=target,
+            observation_dates=[date(2026, 1, 5)],
+        )
+
+        assert len(matrix) == 1
+        # Div on t0 excluded. Div on t2 (5 on 95 close) offsets price drop from 100 to 95.
+        # Total return = (95/100) * (1 + 5/95) - 1 = 0.00
+        assert matrix.target_vector[0] == Decimal("0")
+
+    def test_actions_after_realization_do_not_affect_label(self, engine: FeatureEngine) -> None:
+        """4. Corporate actions executed after the realization date have zero effect on the label."""
+        inst_id = uuid4()
+        bars = [
+            make_bar(datetime(2026, 1, 5, 10, tzinfo=UTC), Decimal("100"), inst_id),  # t0
+            make_bar(
+                datetime(2026, 1, 6, 10, tzinfo=UTC), Decimal("105"), inst_id
+            ),  # t1 (realization)
+            make_bar(datetime(2026, 1, 7, 10, tzinfo=UTC), Decimal("52.5"), inst_id),  # t2
+        ]
+        # Split on t2 (after t1 realization)
+        future_split = CorporateAction(
+            instrument_id=inst_id,
+            action_type=CorporateActionType.SPLIT,
+            execution_date=date(2026, 1, 7),
+            value=Decimal("2"),
+        )
+        repo = InMemoryCorporateActionRepository([future_split])
+        builder = DatasetBuilder(feature_engine=engine, corporate_action_repository=repo)
+
+        features = [
+            FeatureDefinition(
+                name="sma",
+                category=FeatureCategory.TECHNICAL,
+                description="1d SMA",
+                parameters={"window": 1},
+            )
+        ]
+        target = TargetDefinition(name="total_return", horizon_bars=1)
+
+        matrix = builder.build_dataset(
+            instrument_id=inst_id,
+            bars=bars,
+            features=features,
+            target=target,
+            observation_dates=[date(2026, 1, 5)],
+        )
+
+        assert len(matrix) == 1
+        # Target from t0 to t1 is 105/100 - 1 = 0.05. Future split at t2 has no effect.
+        assert matrix.target_vector[0] == Decimal("0.05")
+
+    def test_historical_feature_values_invariant_to_future_corporate_action_records(
+        self, engine: FeatureEngine
+    ) -> None:
+        """5. Historical feature values are completely invariant to future corporate actions."""
+        inst_id = uuid4()
+        closes = ["100", "102", "104", "106", "108", "54", "55"]
+        bars = make_daily_series(date(2026, 1, 5), closes, inst_id)
+
+        # Split at index 5 (2026-01-10)
+        split = CorporateAction(
+            instrument_id=inst_id,
+            action_type=CorporateActionType.SPLIT,
+            execution_date=date(2026, 1, 10),
+            value=Decimal("2"),
+        )
+        repo_with_split = InMemoryCorporateActionRepository([split])
+        repo_empty = InMemoryCorporateActionRepository([])
+
+        builder_split = DatasetBuilder(
+            feature_engine=engine, corporate_action_repository=repo_with_split
+        )
+        builder_clean = DatasetBuilder(
+            feature_engine=engine, corporate_action_repository=repo_empty
+        )
+
+        features = [
+            FeatureDefinition(
+                name="return",
+                category=FeatureCategory.TECHNICAL,
+                description="1d return",
+                parameters={"window": 1},
+            ),
+            FeatureDefinition(
+                name="sma",
+                category=FeatureCategory.TECHNICAL,
+                description="3d SMA",
+                parameters={"window": 3},
+            ),
+        ]
+        target = TargetDefinition(name="total_return", horizon_bars=1)
+
+        matrix_split = builder_split.build_dataset(
+            instrument_id=inst_id, bars=bars, features=features, target=target
+        )
+        matrix_clean = builder_clean.build_dataset(
+            instrument_id=inst_id, bars=bars, features=features, target=target
+        )
+
+        # Feature matrix values must be identical across both datasets
+        assert len(matrix_split) == len(matrix_clean)
+        for row_s, row_c in zip(matrix_split.rows, matrix_clean.rows, strict=True):
+            assert row_s.feature_values == row_c.feature_values
+
+    def test_actual_realization_dates_preserved(self, engine: FeatureEngine) -> None:
+        """6. Actual discrete future trading-bar realization dates are preserved."""
+        inst_id = uuid4()
+        # Friday Jan 9, Monday Jan 12 (skipping weekend Jan 10-11)
+        bars = [
+            make_bar(datetime(2026, 1, 9, 10, tzinfo=UTC), Decimal("100"), inst_id),
+            make_bar(datetime(2026, 1, 12, 10, tzinfo=UTC), Decimal("102"), inst_id),
+        ]
+        repo = InMemoryCorporateActionRepository([])
+        builder = DatasetBuilder(feature_engine=engine, corporate_action_repository=repo)
+
+        features = [
+            FeatureDefinition(
+                name="sma",
+                category=FeatureCategory.TECHNICAL,
+                description="1d SMA",
+                parameters={"window": 1},
+            )
+        ]
+        target = TargetDefinition(name="total_return", horizon_bars=1)
+
+        matrix = builder.build_dataset(
+            instrument_id=inst_id, bars=bars, features=features, target=target
+        )
+
+        assert len(matrix) == 1
+        assert matrix.rows[0].observation_date == date(2026, 1, 9)
+        assert matrix.rows[0].realization_date == date(2026, 1, 12)
+
+    def test_missing_corporate_action_data_follows_explicit_policy(
+        self, engine: FeatureEngine
+    ) -> None:
+        """7. Missing corporate-action data follows an explicit policy (rejects unconfigured total_return; drops unrealizable rows)."""
+        inst_id = uuid4()
+        bars = [
+            make_bar(datetime(2026, 1, 5, 10, tzinfo=UTC), Decimal("100"), inst_id),
+            make_bar(datetime(2026, 1, 6, 10, tzinfo=UTC), Decimal("102"), inst_id),
+        ]
+        features = [
+            FeatureDefinition(
+                name="sma",
+                category=FeatureCategory.TECHNICAL,
+                description="1d SMA",
+                parameters={"window": 1},
+            )
+        ]
+        target = TargetDefinition(name="total_return", horizon_bars=1)
+
+        # Policy A: If no repository and no corporate_actions provided, raise ValueError
+        builder_no_repo = DatasetBuilder(feature_engine=engine)
+        with pytest.raises(
+            ValueError,
+            match="Target 'total_return' requires corporate actions",
+        ):
+            builder_no_repo.build_dataset(
+                instrument_id=inst_id, bars=bars, features=features, target=target
+            )
+
+        # Policy B: If a dividend is recorded inside horizon but its ex-date bar is missing, drop row
+        dividend = CorporateAction(
+            instrument_id=inst_id,
+            action_type=CorporateActionType.DIVIDEND,
+            execution_date=date(2026, 1, 6),  # ex-date Jan 6
+            value=Decimal("2.00"),
+        )
+        repo = InMemoryCorporateActionRepository([dividend])
+        builder_with_repo = DatasetBuilder(feature_engine=engine, corporate_action_repository=repo)
+
+        # Available bars: Jan 5 (t0) and Jan 7 (t1). Jan 6 bar is missing!
+        bars_missing_ex = [
+            make_bar(datetime(2026, 1, 5, 10, tzinfo=UTC), Decimal("100"), inst_id),
+            make_bar(datetime(2026, 1, 7, 10, tzinfo=UTC), Decimal("102"), inst_id),
+        ]
+        matrix = builder_with_repo.build_dataset(
+            instrument_id=inst_id,
+            bars=bars_missing_ex,
+            features=features,
+            target=target,
+            observation_dates=[date(2026, 1, 5)],
+        )
+
+        # The row is dropped because the target cannot be realized without fabricating ex-date prices
+        assert len(matrix) == 0
+        assert matrix.dropped_incomplete_target_count == 1
+
+    def test_multiple_instruments_remain_isolated(self, engine: FeatureEngine) -> None:
+        """8. Interleaved multi-instrument bars and actions remain strictly isolated."""
+        inst_a = uuid4()
+        inst_b = uuid4()
+
+        bars = [
+            make_bar(datetime(2026, 1, 5, 10, tzinfo=UTC), Decimal("100"), inst_a),
+            make_bar(datetime(2026, 1, 5, 10, tzinfo=UTC), Decimal("500"), inst_b),
+            make_bar(datetime(2026, 1, 6, 10, tzinfo=UTC), Decimal("110"), inst_a),
+            make_bar(datetime(2026, 1, 6, 10, tzinfo=UTC), Decimal("250"), inst_b),
+        ]
+
+        # 2-for-1 split for instrument B only
+        split_b = CorporateAction(
+            instrument_id=inst_b,
+            action_type=CorporateActionType.SPLIT,
+            execution_date=date(2026, 1, 6),
+            value=Decimal("2"),
+        )
+        repo = InMemoryCorporateActionRepository([split_b])
+        builder = DatasetBuilder(feature_engine=engine, corporate_action_repository=repo)
+
+        features = [
+            FeatureDefinition(
+                name="sma",
+                category=FeatureCategory.TECHNICAL,
+                description="1d SMA",
+                parameters={"window": 1},
+            )
+        ]
+        target = TargetDefinition(name="total_return", horizon_bars=1)
+
+        matrix_a = builder.build_dataset(
+            instrument_id=inst_a, bars=bars, features=features, target=target
+        )
+        matrix_b = builder.build_dataset(
+            instrument_id=inst_b, bars=bars, features=features, target=target
+        )
+
+        # Instrument A: (110 / 100) - 1 = 0.10 (not affected by split of B)
+        assert len(matrix_a) == 1
+        assert matrix_a.target_vector[0] == Decimal("0.1")
+
+        # Instrument B: split applies -> 250 / (500 / 2) - 1 = 0.00
+        assert len(matrix_b) == 1
+        assert matrix_b.target_vector[0] == Decimal("0")
+
+    def test_existing_chronological_split_purge_and_embargo_unchanged(
+        self, engine: FeatureEngine
+    ) -> None:
+        """9. FeatureMatrix built with total_return integrates seamlessly with DatasetSplitter."""
+        inst_id = uuid4()
+        closes = [str(100 + i) for i in range(25)]
+        bars = make_daily_series(date(2026, 1, 1), closes, inst_id)
+
+        repo = InMemoryCorporateActionRepository([])
+        builder = DatasetBuilder(feature_engine=engine, corporate_action_repository=repo)
+
+        features = [
+            FeatureDefinition(
+                name="return",
+                category=FeatureCategory.TECHNICAL,
+                description="1d return",
+                parameters={"window": 1},
+            )
+        ]
+        target = TargetDefinition(name="total_return", horizon_bars=3)
+
+        matrix = builder.build_dataset(
+            instrument_id=inst_id, bars=bars, features=features, target=target
+        )
+
+        splitter = DatasetSplitter()
+        split_result = splitter.split(matrix, SplitConfig.default())
+
+        assert len(split_result.train_rows) > 0
+        assert len(split_result.val_rows) > 0
+        assert len(split_result.test_rows) > 0
+        assert split_result.retained_rows + split_result.total_removed_rows == len(matrix)
+
+    def test_end_to_end_dataset_construction_both_target_types(self, engine: FeatureEngine) -> None:
+        """10. End-to-end dataset construction comparing forward_return and total_return."""
+        inst_id = uuid4()
+        # 15 days of bars
+        closes = [
+            "100",
+            "102",
+            "104",
+            "106",
+            "108",
+            "110",
+            "112",
+            "114",
+            "57",
+            "58",  # 2-for-1 split between bar 7 (114) and bar 8 (57)
+            "59",
+            "60",
+            "61",
+            "62",
+            "63",
+        ]
+        bars = make_daily_series(date(2026, 1, 1), closes, inst_id)
+
+        # Split on bar 8 date (2026-01-09)
+        split = CorporateAction(
+            instrument_id=inst_id,
+            action_type=CorporateActionType.SPLIT,
+            execution_date=date(2026, 1, 9),
+            value=Decimal("2"),
+        )
+        repo = InMemoryCorporateActionRepository([split])
+        builder = DatasetBuilder(feature_engine=engine, corporate_action_repository=repo)
+
+        features = [
+            FeatureDefinition(
+                name="return",
+                category=FeatureCategory.TECHNICAL,
+                description="1d return",
+                parameters={"window": 1},
+            ),
+            FeatureDefinition(
+                name="sma",
+                category=FeatureCategory.TECHNICAL,
+                description="3d SMA",
+                parameters={"window": 3},
+            ),
+        ]
+
+        target_fwd = TargetDefinition(name="forward_return", horizon_bars=1)
+        target_tot = TargetDefinition(name="total_return", horizon_bars=1)
+
+        matrix_fwd = builder.build_dataset(
+            instrument_id=inst_id, bars=bars, features=features, target=target_fwd
+        )
+        matrix_tot = builder.build_dataset(
+            instrument_id=inst_id, bars=bars, features=features, target=target_tot
+        )
+
+        assert len(matrix_fwd) == len(matrix_tot)
+        assert matrix_fwd.feature_names == matrix_tot.feature_names
+
+        # Compare row by row:
+        for row_f, row_t in zip(matrix_fwd.rows, matrix_tot.rows, strict=True):
+            assert row_f.observation_date == row_t.observation_date
+            assert row_f.realization_date == row_t.realization_date
+            assert row_f.feature_values == row_t.feature_values
+
+            # On bar 7 (2026-01-08) pointing to bar 8 (2026-01-09):
+            if row_f.observation_date == date(2026, 1, 8):
+                # Raw forward return: 57 / 114 - 1 = -0.50 (looks like 50% crash)
+                assert row_f.target_value == Decimal("-0.5")
+                # Split-adjusted total return: 57 / (114 / 2) - 1 = 57 / 57 - 1 = 0.00
+                assert row_t.target_value == Decimal("0")
+
+
+class TestDatasetBuilderQueryBounding:
+    """Tests verifying that the corporate-action repository receives the correct end_date bound."""
+
+    def test_repository_receives_end_date_equal_to_last_bar_date(
+        self, engine: FeatureEngine
+    ) -> None:
+        """Repository get_by_instrument is called with end_date=last_bar_date."""
+        inst_id = uuid4()
+        bars = [
+            make_bar(datetime(2026, 1, 5, 10, tzinfo=UTC), Decimal("100"), inst_id),
+            make_bar(datetime(2026, 1, 6, 10, tzinfo=UTC), Decimal("105"), inst_id),
+            make_bar(datetime(2026, 1, 7, 10, tzinfo=UTC), Decimal("110"), inst_id),
+        ]
+
+        # Track which kwargs get_by_instrument was called with
+        captured_calls: list[dict] = []
+
+        class TrackingRepository(CorporateActionRepository):
+            def get_by_id(self, corporate_action_id: UUID) -> CorporateAction | None:
+                return None
+
+            def get_by_instrument(
+                self,
+                instrument_id: UUID,
+                start_date: date | None = None,
+                end_date: date | None = None,
+                action_type=None,
+            ) -> list[CorporateAction]:
+                captured_calls.append(
+                    {
+                        "instrument_id": instrument_id,
+                        "start_date": start_date,
+                        "end_date": end_date,
+                        "action_type": action_type,
+                    }
+                )
+                return []
+
+            def get_by_instrument_and_date(
+                self,
+                instrument_id: UUID,
+                execution_date: date,
+                action_type=None,
+            ) -> list[CorporateAction]:
+                return []
+
+            def save(self, action: CorporateAction) -> None:
+                pass
+
+        repo = TrackingRepository()
+        builder = DatasetBuilder(feature_engine=engine, corporate_action_repository=repo)
+        features = [
+            FeatureDefinition(
+                name="sma",
+                category=FeatureCategory.TECHNICAL,
+                description="1d SMA",
+                parameters={"window": 1},
+            )
+        ]
+        target = TargetDefinition(name="total_return", horizon_bars=1)
+        builder.build_dataset(instrument_id=inst_id, bars=bars, features=features, target=target)
+
+        assert len(captured_calls) == 1
+        call = captured_calls[0]
+        assert call["instrument_id"] == inst_id
+        # end_date must equal the date of the last available bar
+        assert call["end_date"] == date(2026, 1, 7)
+        # start_date is not bounded (remains None; the whole history is valid for target windows)
+        assert call["start_date"] is None
+
+    def test_actions_after_last_bar_are_not_required_for_dataset(
+        self, engine: FeatureEngine
+    ) -> None:
+        """Corporate actions whose execution_date is after the last bar have no effect on labels."""
+        inst_id = uuid4()
+        bars = [
+            make_bar(datetime(2026, 1, 5, 10, tzinfo=UTC), Decimal("100"), inst_id),
+            make_bar(datetime(2026, 1, 6, 10, tzinfo=UTC), Decimal("105"), inst_id),
+        ]
+
+        # Split scheduled well after the last available bar — must be excluded by end_date bounding
+        future_split = CorporateAction(
+            instrument_id=inst_id,
+            action_type=CorporateActionType.SPLIT,
+            execution_date=date(2026, 3, 1),  # far after last bar (2026-01-06)
+            value=Decimal("2"),
+        )
+        # InMemoryCorporateActionRepository honours end_date filtering
+        repo = InMemoryCorporateActionRepository([future_split])
+        builder = DatasetBuilder(feature_engine=engine, corporate_action_repository=repo)
+
+        features = [
+            FeatureDefinition(
+                name="sma",
+                category=FeatureCategory.TECHNICAL,
+                description="1d SMA",
+                parameters={"window": 1},
+            )
+        ]
+        target = TargetDefinition(name="total_return", horizon_bars=1)
+        matrix = builder.build_dataset(
+            instrument_id=inst_id, bars=bars, features=features, target=target
+        )
+
+        assert len(matrix) == 1
+        # No split inside the horizon: total return = (105/100) - 1 = 0.05
+        assert matrix.target_vector[0] == Decimal("0.05")
+
+    def test_forward_return_target_does_not_query_repository(self, engine: FeatureEngine) -> None:
+        """forward_return callers with no repository remain fully functional (no repo query)."""
+        inst_id = uuid4()
+        bars = [
+            make_bar(datetime(2026, 1, 5, 10, tzinfo=UTC), Decimal("100"), inst_id),
+            make_bar(datetime(2026, 1, 6, 10, tzinfo=UTC), Decimal("110"), inst_id),
+        ]
+        builder = DatasetBuilder(feature_engine=engine)  # no repository
+        features = [
+            FeatureDefinition(
+                name="sma",
+                category=FeatureCategory.TECHNICAL,
+                description="1d SMA",
+                parameters={"window": 1},
+            )
+        ]
+        target = TargetDefinition(name="forward_return", horizon_bars=1)
+        matrix = builder.build_dataset(
+            instrument_id=inst_id, bars=bars, features=features, target=target
+        )
+        assert len(matrix) == 1
+        assert matrix.target_vector[0] == Decimal("0.1")
+
+    def test_empty_bars_does_not_query_repository(self, engine: FeatureEngine) -> None:
+        """Empty bar input avoids querying the repository entirely (no unbounded end_date=None lookup)."""
+        inst_id = uuid4()
+        other_id = uuid4()
+        captured_calls: list[dict] = []
+
+        class TrackingRepository(CorporateActionRepository):
+            def get_by_id(self, corporate_action_id: UUID) -> CorporateAction | None:
+                return None
+
+            def get_by_instrument(
+                self,
+                instrument_id: UUID,
+                start_date: date | None = None,
+                end_date: date | None = None,
+                action_type=None,
+            ) -> list[CorporateAction]:
+                captured_calls.append({"instrument_id": instrument_id, "end_date": end_date})
+                return []
+
+            def get_by_instrument_and_date(
+                self,
+                instrument_id: UUID,
+                execution_date: date,
+                action_type=None,
+            ) -> list[CorporateAction]:
+                return []
+
+            def save(self, action: CorporateAction) -> None:
+                pass
+
+        repo = TrackingRepository()
+        builder = DatasetBuilder(feature_engine=engine, corporate_action_repository=repo)
+        features = [
+            FeatureDefinition(
+                name="sma",
+                category=FeatureCategory.TECHNICAL,
+                description="1d SMA",
+                parameters={"window": 1},
+            )
+        ]
+        target = TargetDefinition(name="total_return", horizon_bars=1)
+
+        # 1. Completely empty bars sequence
+        matrix_empty = builder.build_dataset(
+            instrument_id=inst_id, bars=[], features=features, target=target
+        )
+        assert len(matrix_empty) == 0
+        assert len(captured_calls) == 0, "Repository must NOT be queried when bars is empty"
+
+        # 2. Bars present only for a different instrument
+        bars_other = [
+            make_bar(datetime(2026, 1, 5, 10, tzinfo=UTC), Decimal("100"), other_id),
+        ]
+        matrix_other = builder.build_dataset(
+            instrument_id=inst_id, bars=bars_other, features=features, target=target
+        )
+        assert len(matrix_other) == 0
+        assert len(captured_calls) == 0, (
+            "Repository must NOT be queried when no bars exist for instrument"
+        )
+
+    def test_empty_bars_with_unconfigured_source_raises_error(self, engine: FeatureEngine) -> None:
+        """Unconfigured corporate action source raises ValueError even when bars is empty."""
+        inst_id = uuid4()
+        builder = DatasetBuilder(feature_engine=engine)  # no repository
+        features = [
+            FeatureDefinition(
+                name="sma",
+                category=FeatureCategory.TECHNICAL,
+                description="1d SMA",
+                parameters={"window": 1},
+            )
+        ]
+        target = TargetDefinition(name="total_return", horizon_bars=1)
+
+        with pytest.raises(
+            ValueError,
+            match="Target 'total_return' requires corporate actions",
+        ):
+            builder.build_dataset(instrument_id=inst_id, bars=[], features=features, target=target)
+
+    def test_action_after_row_realization_cannot_affect_label_even_if_fetched_for_dataset(
+        self, engine: FeatureEngine
+    ) -> None:
+        """An action within the dataset range (fetched) cannot affect an earlier row whose realization preceded it."""
+        inst_id = uuid4()
+        # 3 daily bars: t0=Jan 5 (100), t1=Jan 6 (105), t2=Jan 7 (52.5)
+        # Horizon = 1 bar:
+        #   Row 0: obs=Jan 5, real=Jan 6
+        #   Row 1: obs=Jan 6, real=Jan 7
+        bars = [
+            make_bar(datetime(2026, 1, 5, 10, tzinfo=UTC), Decimal("100"), inst_id),
+            make_bar(datetime(2026, 1, 6, 10, tzinfo=UTC), Decimal("105"), inst_id),
+            make_bar(datetime(2026, 1, 7, 10, tzinfo=UTC), Decimal("52.5"), inst_id),
+        ]
+
+        # 2:1 split on Jan 7 (inside the overall dataset bounds, so fetched with end_date=2026-01-07)
+        split_jan7 = CorporateAction(
+            instrument_id=inst_id,
+            action_type=CorporateActionType.SPLIT,
+            execution_date=date(2026, 1, 7),
+            value=Decimal("2"),
+        )
+        repo = InMemoryCorporateActionRepository([split_jan7])
+        builder = DatasetBuilder(feature_engine=engine, corporate_action_repository=repo)
+
+        features = [
+            FeatureDefinition(
+                name="sma",
+                category=FeatureCategory.TECHNICAL,
+                description="1d SMA",
+                parameters={"window": 1},
+            )
+        ]
+        target = TargetDefinition(name="total_return", horizon_bars=1)
+
+        matrix = builder.build_dataset(
+            instrument_id=inst_id, bars=bars, features=features, target=target
+        )
+
+        assert len(matrix) == 2
+
+        # Row 0 (Jan 5 -> Jan 6): Realization is Jan 6. Split is Jan 7.
+        # Split is AFTER realization date -> must NOT affect Row 0.
+        # Raw return: 105 / 100 - 1 = 0.05
+        assert matrix.rows[0].observation_date == date(2026, 1, 5)
+        assert matrix.rows[0].realization_date == date(2026, 1, 6)
+        assert matrix.rows[0].target_value == Decimal("0.05")
+
+        # Row 1 (Jan 6 -> Jan 7): Realization is Jan 7. Split is Jan 7.
+        # Split is ON realization date -> applies to Row 1.
+        # Adjusted return: 52.5 / (105 / 2) - 1 = 52.5 / 52.5 - 1 = 0.00
+        assert matrix.rows[1].observation_date == date(2026, 1, 6)
+        assert matrix.rows[1].realization_date == date(2026, 1, 7)
+        assert matrix.rows[1].target_value == Decimal("0")
+
+
+class TestDatasetBuilderConstructor:
+    """Tests verifying the constructor parameter contract and collaborator isolation."""
+
+    def test_default_construction(self, engine: FeatureEngine) -> None:
+        """Default constructor instantiates standard ForwardReturnCalculator and TotalReturnCalculator."""
+        from app.domain.prediction.calculators.forward_return_calculator import (
+            ForwardReturnCalculator,
+        )
+        from app.domain.prediction.calculators.total_return_calculator import (
+            TotalReturnCalculator,
+        )
+
+        builder = DatasetBuilder(feature_engine=engine)
+        assert builder.feature_engine is engine
+        assert isinstance(builder.target_calculator, ForwardReturnCalculator)
+        assert isinstance(builder.total_return_calculator, TotalReturnCalculator)
+        assert builder.corporate_action_repository is None
+
+    def test_explicit_collaborators_injection(self, engine: FeatureEngine) -> None:
+        """Explicit collaborators are bound directly to their corresponding properties."""
+        from app.domain.prediction.calculators.forward_return_calculator import (
+            ForwardReturnCalculator,
+        )
+        from app.domain.prediction.calculators.total_return_calculator import (
+            TotalReturnCalculator,
+        )
+
+        fwd_calc = ForwardReturnCalculator()
+        tot_calc = TotalReturnCalculator()
+        repo = InMemoryCorporateActionRepository([])
+
+        builder = DatasetBuilder(
+            feature_engine=engine,
+            target_calculator=fwd_calc,
+            corporate_action_repository=repo,
+            total_return_calculator=tot_calc,
+        )
+        assert builder.target_calculator is fwd_calc
+        assert builder.total_return_calculator is tot_calc
+        assert builder.corporate_action_repository is repo
+
+    def test_parameter_isolation(self, engine: FeatureEngine) -> None:
+        """Injecting target_calculator or total_return_calculator isolates each to its own property."""
+        from app.domain.prediction.calculators.forward_return_calculator import (
+            ForwardReturnCalculator,
+        )
+        from app.domain.prediction.calculators.total_return_calculator import (
+            TotalReturnCalculator,
+        )
+
+        fwd_calc = ForwardReturnCalculator()
+        builder_fwd = DatasetBuilder(feature_engine=engine, target_calculator=fwd_calc)
+        assert builder_fwd.target_calculator is fwd_calc
+        assert isinstance(builder_fwd.total_return_calculator, TotalReturnCalculator)
+        assert builder_fwd.total_return_calculator is not fwd_calc
+
+        tot_calc = TotalReturnCalculator()
+        builder_tot = DatasetBuilder(feature_engine=engine, total_return_calculator=tot_calc)
+        assert builder_tot.total_return_calculator is tot_calc
+        assert isinstance(builder_tot.target_calculator, ForwardReturnCalculator)
+        assert builder_tot.target_calculator is not tot_calc
+
+    def test_type_validation_rejects_invalid_collaborators(self, engine: FeatureEngine) -> None:
+        """Constructor validates collaborator types and rejects invalid inputs with TypeError."""
+        with pytest.raises(TypeError, match="feature_engine must be a FeatureEngine instance"):
+            DatasetBuilder(feature_engine="not_an_engine")  # type: ignore[arg-type]
+
+        with pytest.raises(
+            TypeError, match="target_calculator must be a ForwardReturnCalculator instance"
+        ):
+            DatasetBuilder(feature_engine=engine, target_calculator="not_a_calc")  # type: ignore[arg-type]
+
+        with pytest.raises(
+            TypeError,
+            match="corporate_action_repository must be a CorporateActionRepository instance",
+        ):
+            DatasetBuilder(feature_engine=engine, corporate_action_repository="not_a_repo")  # type: ignore[arg-type]
+
+        with pytest.raises(
+            TypeError, match="total_return_calculator must be a TotalReturnCalculator instance"
+        ):
+            DatasetBuilder(feature_engine=engine, total_return_calculator="not_a_calc")  # type: ignore[arg-type]
