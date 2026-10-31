@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 from decimal import Decimal
 from unittest.mock import MagicMock
-from uuid import uuid4,UUID
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -78,13 +78,9 @@ class TestMarketDataService:
         bar2 = make_bar(sample_instrument.instrument_id, end)
         mock_bar_repo.get_bars.return_value = [bar1, bar2]
 
-        bars = market_data_service.get_historical_bars(
-            sample_instrument.instrument_id, start, end
-        )
+        bars = market_data_service.get_historical_bars(sample_instrument.instrument_id, start, end)
         assert bars == [bar1, bar2]
-        mock_bar_repo.get_bars.assert_called_once_with(
-            sample_instrument.instrument_id, start, end
-        )
+        mock_bar_repo.get_bars.assert_called_once_with(sample_instrument.instrument_id, start, end)
 
     def test_get_historical_bars_instrument_not_found(
         self,
@@ -189,9 +185,7 @@ class TestMarketDataService:
         bar = make_bar(sample_instrument.instrument_id, start)
         mock_bar_repo.get_bars.return_value = [bar]
 
-        result = market_data_service.get_bars_by_symbol(
-            "RELIANCE", "NSE", start, end
-        )
+        result = market_data_service.get_bars_by_symbol("RELIANCE", "NSE", start, end)
         assert result == [bar]
 
     def test_get_latest_bar_by_symbol(

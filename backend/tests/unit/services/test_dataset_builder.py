@@ -1,6 +1,7 @@
 from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
@@ -11,6 +12,8 @@ from app.domain.enums.corporate_action_type import CorporateActionType
 from app.domain.features.feature_category import FeatureCategory
 from app.domain.features.feature_definition import FeatureDefinition
 from app.domain.prediction.dataset import DatasetRow, FeatureMatrix
+from app.domain.prediction.inference_matrix import InferenceMatrix
+from app.domain.prediction.split_config import SplitConfig
 from app.domain.prediction.target_definition import TargetDefinition
 from app.domain.repositories.corporate_action_repository import (
     CorporateActionRepository,
@@ -18,7 +21,7 @@ from app.domain.repositories.corporate_action_repository import (
 from app.services.features.feature_calculator_registry import create_default_feature_registry
 from app.services.features.feature_engine import FeatureEngine
 from app.services.prediction.dataset_builder import DatasetBuilder, generate_feature_name
-from app.services.prediction.dataset_splitter import DatasetSplitter, SplitConfig
+from app.services.prediction.dataset_splitter import DatasetSplitter
 
 # ===========================================================================
 # Helpers & Fixtures
@@ -637,8 +640,14 @@ class TestDatasetBuilderCore:
         with pytest.raises(TypeError, match="instrument_id"):
             builder.build_dataset("not-a-uuid", bars, [feat], target)  # type: ignore[arg-type]
 
-        # Empty features
-        with pytest.raises(ValueError, match="At least one FeatureDefinition"):
+        # Invalid features container type
+        with pytest.raises(TypeError, match="features must be a sequence of FeatureDefinition"):
+            builder.build_dataset(inst_id, bars, 123, target)  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="features must be a sequence of FeatureDefinition"):
+            builder.build_dataset(inst_id, bars, "not-a-sequence", target)  # type: ignore[arg-type]
+
+        # Empty features sequence
+        with pytest.raises(ValueError, match="At least one FeatureDefinition must be supplied"):
             builder.build_dataset(inst_id, bars, [], target)
 
         # Invalid features element
@@ -649,9 +658,15 @@ class TestDatasetBuilderCore:
         with pytest.raises(TypeError, match="target"):
             builder.build_dataset(inst_id, bars, [feat], "not-a-target")  # type: ignore[arg-type]
 
+        # Invalid bars container type
+        with pytest.raises(TypeError, match="bars must be a sequence of MarketBar"):
+            builder.build_dataset(inst_id, 123, [feat], target)  # type: ignore[arg-type]
+
         # Invalid bars element
         with pytest.raises(TypeError, match="bars\\[0\\]"):
             builder.build_dataset(inst_id, ["not-a-bar"], [feat], target)  # type: ignore[list-item]
+        with pytest.raises(TypeError, match="bars\\[0\\]"):
+            builder.build_dataset(inst_id, [123], [feat], target)  # type: ignore[list-item]
 
         # Invalid observation_dates with datetime instead of date
         with pytest.raises(TypeError, match="must be a date, not a datetime"):
@@ -1853,7 +1868,7 @@ class TestDatasetBuilderQueryBounding:
         ]
 
         # Track which kwargs get_by_instrument was called with
-        captured_calls: list[dict] = []
+        captured_calls: list[dict[str, Any]] = []
 
         class TrackingRepository(CorporateActionRepository):
             def get_by_id(self, corporate_action_id: UUID) -> CorporateAction | None:
@@ -1864,7 +1879,7 @@ class TestDatasetBuilderQueryBounding:
                 instrument_id: UUID,
                 start_date: date | None = None,
                 end_date: date | None = None,
-                action_type=None,
+                action_type: CorporateActionType | None = None,
             ) -> list[CorporateAction]:
                 captured_calls.append(
                     {
@@ -1880,7 +1895,7 @@ class TestDatasetBuilderQueryBounding:
                 self,
                 instrument_id: UUID,
                 execution_date: date,
-                action_type=None,
+                action_type: CorporateActionType | None = None,
             ) -> list[CorporateAction]:
                 return []
 
@@ -1973,7 +1988,7 @@ class TestDatasetBuilderQueryBounding:
         """Empty bar input avoids querying the repository entirely (no unbounded end_date=None lookup)."""
         inst_id = uuid4()
         other_id = uuid4()
-        captured_calls: list[dict] = []
+        captured_calls: list[dict[str, Any]] = []
 
         class TrackingRepository(CorporateActionRepository):
             def get_by_id(self, corporate_action_id: UUID) -> CorporateAction | None:
@@ -1984,7 +1999,7 @@ class TestDatasetBuilderQueryBounding:
                 instrument_id: UUID,
                 start_date: date | None = None,
                 end_date: date | None = None,
-                action_type=None,
+                action_type: CorporateActionType | None = None,
             ) -> list[CorporateAction]:
                 captured_calls.append({"instrument_id": instrument_id, "end_date": end_date})
                 return []
@@ -1993,7 +2008,7 @@ class TestDatasetBuilderQueryBounding:
                 self,
                 instrument_id: UUID,
                 execution_date: date,
-                action_type=None,
+                action_type: CorporateActionType | None = None,
             ) -> list[CorporateAction]:
                 return []
 
@@ -2189,3 +2204,279 @@ class TestDatasetBuilderConstructor:
             TypeError, match="total_return_calculator must be a TotalReturnCalculator instance"
         ):
             DatasetBuilder(feature_engine=engine, total_return_calculator="not_a_calc")  # type: ignore[arg-type]
+
+
+class TestDatasetBuilderInference:
+    def test_training_and_inference_feature_parity(self, builder: DatasetBuilder) -> None:
+        """Training and inference feature calculations produce identical feature values for the same history."""
+        inst_id = uuid4()
+        closes = [str(100 + i * 2) for i in range(15)]
+        bars = make_daily_series(date(2026, 1, 1), closes, inst_id)
+
+        features = [
+            FeatureDefinition(
+                name="sma",
+                category=FeatureCategory.TECHNICAL,
+                description="5d SMA",
+                parameters={"window": 5},
+            ),
+            FeatureDefinition(
+                name="return",
+                category=FeatureCategory.TECHNICAL,
+                description="1d Return",
+                parameters={"window": 1},
+            ),
+            FeatureDefinition(
+                name="bollinger_bands",
+                category=FeatureCategory.TECHNICAL,
+                description="Upper BB",
+                parameters={"window": 5, "band": "upper", "k": 2},
+            ),
+        ]
+        target = TargetDefinition(name="forward_return", horizon_bars=2)
+
+        train_m = builder.build_dataset(inst_id, bars, features, target)
+        inf_m = builder.build_inference_dataset(inst_id, bars, features)
+
+        assert inf_m.feature_names == train_m.feature_names
+        assert len(train_m) > 0
+
+        # Every observation date in training must have an exact matching row in inference
+        inf_by_date = {r.observation_date: r for r in inf_m.rows}
+        for train_row in train_m.rows:
+            assert train_row.observation_date in inf_by_date
+            inf_row = inf_by_date[train_row.observation_date]
+            assert train_row.feature_values == inf_row.feature_values
+
+    def test_inference_succeeds_on_latest_unrealized_bar(self, builder: DatasetBuilder) -> None:
+        """Inference evaluates the latest market bar where the future return is unrealized."""
+        inst_id = uuid4()
+        closes = [str(100 + i) for i in range(10)]
+        bars = make_daily_series(date(2026, 1, 1), closes, inst_id)
+
+        feat = FeatureDefinition(
+            name="return",
+            category=FeatureCategory.TECHNICAL,
+            description="1d Return",
+            parameters={"window": 1},
+        )
+        target = TargetDefinition(name="forward_return", horizon_bars=2)
+
+        train_m = builder.build_dataset(inst_id, bars, [feat], target)
+        inf_m = builder.build_inference_dataset(inst_id, bars, [feat])
+
+        # For 10 bars with horizon 2:
+        # Index 0: missing 1d return
+        # Indices 1..7: complete target -> 7 rows in train
+        # Indices 8..9: missing forward target (unrealized future) -> dropped in train
+        assert len(train_m) == 7
+        assert train_m.dropped_incomplete_target_count == 2
+
+        # In inference: indices 1..9 are complete (including latest bar at index 9: date 2026-01-10)
+        assert len(inf_m) == 9
+        latest_row = inf_m.rows[-1]
+        assert latest_row.observation_date == date(2026, 1, 10)
+        # 1d return on latest bar: (109 / 108) - 1
+        expected_ret = (Decimal("109") / Decimal("108")) - Decimal("1")
+        assert latest_row.feature_values[0] == expected_ret
+
+    def test_raw_price_feature_parity_under_stock_split_discontinuity(
+        self, builder: DatasetBuilder
+    ) -> None:
+        """Feature parity between training and inference across a stock split under raw price semantics.
+
+        Under Phase 5.4 contract C1 (raw unadjusted prices), calculating a 1-day return
+        across a 2:1 stock split produces an artificial -50% discontinuity. This is NOT an
+        economically meaningful investment return, but reflects the locked raw-price
+        feature calculation semantics. This test verifies that training and inference
+        feature pipelines exhibit identical parity under these raw-price semantics without
+        divergent adjustment pathways, and confirms corporate actions are not queried for inference.
+        """
+        inst_id = uuid4()
+        # Bar 0..4 at 200, Bar 5..9 at 100 (2:1 split executed on day 5: 2026-01-06)
+        closes = ["200", "200", "200", "200", "200", "100", "100", "100", "100", "100"]
+        bars = make_daily_series(date(2026, 1, 1), closes, inst_id)
+
+        feat = FeatureDefinition(
+            name="return",
+            category=FeatureCategory.TECHNICAL,
+            description="1d Return",
+            parameters={"window": 1},
+        )
+        target = TargetDefinition(name="forward_return", horizon_bars=1)
+
+        train_m = builder.build_dataset(inst_id, bars, [feat], target)
+        inf_m = builder.build_inference_dataset(inst_id, bars, [feat])
+
+        # Parity check on split date (2026-01-06)
+        split_date = date(2026, 1, 6)
+        train_split_row = next(r for r in train_m.rows if r.observation_date == split_date)
+        inf_split_row = next(r for r in inf_m.rows if r.observation_date == split_date)
+
+        # Both produce identical raw -50% return: (100 / 200) - 1 = -0.50
+        assert train_split_row.feature_values[0] == Decimal("-0.5")
+        assert inf_split_row.feature_values[0] == Decimal("-0.5")
+        assert train_split_row.feature_values == inf_split_row.feature_values
+
+    def test_inference_observation_date_semantics(self, builder: DatasetBuilder) -> None:
+        """Deterministic observation-date semantics for build_inference_dataset."""
+        inst_id = uuid4()
+        closes = ["100", "102", "104", "106", "108"]
+        # Dates: Jan 1, Jan 2, Jan 3, Jan 4, Jan 5
+        bars = make_daily_series(date(2026, 1, 1), closes, inst_id)
+
+        feat = FeatureDefinition(
+            name="return",
+            category=FeatureCategory.TECHNICAL,
+            description="1d",
+            parameters={"window": 1},
+        )
+
+        # 1. observation_dates=None evaluates all bars (Jan 1 lacks 1d return, so Jan 2..5 retained)
+        m_none = builder.build_inference_dataset(inst_id, bars, [feat], observation_dates=None)
+        assert len(m_none) == 4
+        assert m_none.observation_dates == (
+            date(2026, 1, 2),
+            date(2026, 1, 3),
+            date(2026, 1, 4),
+            date(2026, 1, 5),
+        )
+
+        # 2. Missing requested dates (e.g. weekends/absent dates) are omitted cleanly
+        req_dates = [date(2026, 1, 2), date(2026, 1, 10), date(2026, 1, 4)]
+        m_req = builder.build_inference_dataset(inst_id, bars, [feat], observation_dates=req_dates)
+        assert len(m_req) == 2
+        assert m_req.observation_dates == (date(2026, 1, 2), date(2026, 1, 4))
+
+        # 3. Unordered requested dates are processed in strictly ascending chronological order
+        unordered_dates = [date(2026, 1, 5), date(2026, 1, 2), date(2026, 1, 3)]
+        m_unordered = builder.build_inference_dataset(
+            inst_id, bars, [feat], observation_dates=unordered_dates
+        )
+        assert m_unordered.observation_dates == (
+            date(2026, 1, 2),
+            date(2026, 1, 3),
+            date(2026, 1, 5),
+        )
+
+        # 4. Duplicate requested dates are rejected with ValueError
+        with pytest.raises(ValueError, match="Duplicate observation dates requested"):
+            builder.build_inference_dataset(
+                inst_id,
+                bars,
+                [feat],
+                observation_dates=[date(2026, 1, 2), date(2026, 1, 2)],
+            )
+
+        # 5. Duplicate market observation dates in bars are rejected with ValueError
+        ts = datetime(2026, 1, 1, 10, 0, tzinfo=UTC)
+        b1 = make_bar(ts, Decimal("100"), inst_id)
+        b2 = make_bar(ts + timedelta(hours=1), Decimal("102"), inst_id)  # Same date!
+        with pytest.raises(ValueError, match="Duplicate market observation dates found"):
+            builder.build_inference_dataset(inst_id, [b1, b2], [feat])
+
+    def test_inference_dataset_incomplete_feature_handling(self, builder: DatasetBuilder) -> None:
+        """Inference dataset tracks dropped incomplete features when historical warmup is insufficient."""
+        inst_id = uuid4()
+        # Only 2 bars
+        bars = make_daily_series(date(2026, 1, 1), ["100", "105"], inst_id)
+
+        feat_20d = FeatureDefinition(
+            name="sma",
+            category=FeatureCategory.TECHNICAL,
+            description="20d",
+            parameters={"window": 20},
+        )
+
+        matrix = builder.build_inference_dataset(inst_id, bars, [feat_20d])
+
+        assert isinstance(matrix, InferenceMatrix)
+        assert len(matrix) == 0
+        assert matrix.rows == ()
+        assert matrix.feature_matrix == ()
+        assert matrix.observation_dates == ()
+        assert matrix.dropped_incomplete_feature_count == 2
+
+    def test_inference_invalid_inputs_rejected(self, builder: DatasetBuilder) -> None:
+        """build_inference_dataset strictly validates inputs."""
+        inst_id = uuid4()
+        bars = make_daily_series(date(2026, 1, 1), ["100"], inst_id)
+        feat = FeatureDefinition(
+            name="return",
+            category=FeatureCategory.TECHNICAL,
+            description="1d",
+            parameters={"window": 1},
+        )
+
+        # Invalid instrument_id
+        with pytest.raises(TypeError, match="instrument_id must be a UUID instance"):
+            builder.build_inference_dataset("not-a-uuid", bars, [feat])  # type: ignore[arg-type]
+
+        # Invalid features container type
+        with pytest.raises(TypeError, match="features must be a sequence of FeatureDefinition"):
+            builder.build_inference_dataset(inst_id, bars, 123)  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="features must be a sequence of FeatureDefinition"):
+            builder.build_inference_dataset(inst_id, bars, "not-a-sequence")  # type: ignore[arg-type]
+
+        # Empty features
+        with pytest.raises(ValueError, match="At least one FeatureDefinition must be supplied"):
+            builder.build_inference_dataset(inst_id, bars, [])
+
+        # Invalid features element
+        with pytest.raises(TypeError, match="features\\[0\\]"):
+            builder.build_inference_dataset(inst_id, bars, ["not-a-feat"])  # type: ignore[list-item]
+
+        # Invalid bars container type
+        with pytest.raises(TypeError, match="bars must be a sequence of MarketBar"):
+            builder.build_inference_dataset(inst_id, 123, [feat])  # type: ignore[arg-type]
+
+        # Invalid bars element
+        with pytest.raises(TypeError, match="bars\\[0\\]"):
+            builder.build_inference_dataset(inst_id, ["not-a-bar"], [feat])  # type: ignore[list-item]
+        with pytest.raises(TypeError, match="bars\\[0\\]"):
+            builder.build_inference_dataset(inst_id, [123], [feat])  # type: ignore[list-item]
+
+        # Datetime in observation_dates
+
+    def test_timestamp_parity_with_timezone_aware_timestamps(self, builder: DatasetBuilder) -> None:
+        """Labeled and inference builders derive identical observation dates from tz-aware timestamps."""
+        inst_id = uuid4()
+        dates = [date(2026, 1, 1) + timedelta(days=i) for i in range(5)]
+        bars = [
+            make_bar(
+                datetime.combine(d, datetime.min.time(), tzinfo=UTC) + timedelta(hours=16),
+                Decimal(str(100 + i * 5)),
+                inst_id,
+            )
+            for i, d in enumerate(dates)
+        ]
+
+        feat_sma = FeatureDefinition(
+            name="sma",
+            category=FeatureCategory.TECHNICAL,
+            description="2d",
+            parameters={"window": 2},
+        )
+        target = TargetDefinition(name="forward_return", horizon_bars=1)
+
+        labeled_matrix = builder.build_dataset(inst_id, bars, [feat_sma], target)
+        inference_matrix = builder.build_inference_dataset(inst_id, bars, [feat_sma])
+
+        assert labeled_matrix.observation_dates == (
+            date(2026, 1, 2),
+            date(2026, 1, 3),
+            date(2026, 1, 4),
+        )
+        assert inference_matrix.observation_dates == (
+            date(2026, 1, 2),
+            date(2026, 1, 3),
+            date(2026, 1, 4),
+            date(2026, 1, 5),
+        )
+
+        labeled_features_by_date = {
+            r.observation_date: r.feature_values for r in labeled_matrix.rows
+        }
+        for inf_row in inference_matrix.rows:
+            if inf_row.observation_date in labeled_features_by_date:
+                assert inf_row.feature_values == labeled_features_by_date[inf_row.observation_date]

@@ -1,5 +1,7 @@
 from app.domain.prediction.calculators.forward_return_calculator import ForwardReturnCalculator
 from app.domain.prediction.dataset import DatasetRow, FeatureMatrix
+from app.domain.prediction.inference_matrix import InferenceMatrix
+from app.domain.prediction.inference_row import InferenceRow
 from app.domain.prediction.split_config import SplitConfig
 from app.domain.prediction.split_result import SplitBoundary, SplitResult
 from app.domain.prediction.target_definition import TargetDefinition
@@ -9,6 +11,8 @@ __all__ = [
     "DatasetRow",
     "FeatureMatrix",
     "ForwardReturnCalculator",
+    "InferenceMatrix",
+    "InferenceRow",
     "SplitBoundary",
     "SplitConfig",
     "SplitResult",

@@ -16,6 +16,8 @@ from app.domain.prediction.calculators.total_return_calculator import (
     TotalReturnCalculator,
 )
 from app.domain.prediction.dataset import DatasetRow, FeatureMatrix
+from app.domain.prediction.inference_matrix import InferenceMatrix
+from app.domain.prediction.inference_row import InferenceRow
 from app.domain.prediction.target_definition import TargetDefinition
 from app.domain.repositories.corporate_action_repository import (
     CorporateActionRepository,
@@ -441,4 +443,155 @@ class DatasetBuilder:
             rows=tuple(rows),
             dropped_incomplete_feature_count=dropped_incomplete_feature_count,
             dropped_incomplete_target_count=dropped_incomplete_target_count,
+        )
+
+    def build_inference_dataset(
+        self,
+        instrument_id: UUID,
+        bars: Sequence[MarketBar],
+        features: Sequence[FeatureDefinition],
+        observation_dates: Sequence[date] | None = None,
+    ) -> InferenceMatrix:
+        """Construct an unlabeled, point-in-time InferenceMatrix for model inference.
+
+        Evaluates features strictly point-in-time using available historical bars up to each
+        observation date. Unlike build_dataset, this method does not require target definitions,
+        corporate actions, or future horizon bars, enabling inference on the latest available
+        market bar.
+
+        Parameters
+        ----------
+        instrument_id:
+            UUID of the instrument to build the dataset for.
+        bars:
+            Available market bars. Bars for other instruments are ignored.
+        features:
+            Sequence of feature definitions. Preserves caller's column ordering.
+        observation_dates:
+            Optional sequence of observation dates to evaluate. If None, all
+            eligible dates in the instrument's bars are evaluated.
+
+        Returns
+        -------
+        InferenceMatrix
+            A validated dataset containing only rows where all features were
+            fully computable up to the observation date.
+        """
+        # 1. Validate scalar / container types
+        if not isinstance(instrument_id, UUID):
+            raise TypeError(
+                f"instrument_id must be a UUID instance, got {type(instrument_id).__name__}"
+            )
+        if not isinstance(features, Sequence) or isinstance(features, (str, bytes)):
+            raise TypeError("features must be a sequence of FeatureDefinition")
+        if len(features) == 0:
+            raise ValueError("At least one FeatureDefinition must be supplied")
+        for i, defn in enumerate(features):
+            if not isinstance(defn, FeatureDefinition):
+                raise TypeError(
+                    f"features[{i}] must be a FeatureDefinition instance, got {type(defn).__name__}"
+                )
+
+        if not isinstance(bars, Sequence) or isinstance(bars, (str, bytes)):
+            raise TypeError("bars must be a sequence of MarketBar")
+        for i, b in enumerate(bars):
+            if not isinstance(b, MarketBar):
+                raise TypeError(f"bars[{i}] must be a MarketBar instance, got {type(b).__name__}")
+
+        # 2. Filter bars by instrument_id and sort chronologically.
+        inst_bars = [b for b in bars if b.instrument_id == instrument_id]
+        sorted_bars = sorted(inst_bars, key=lambda b: b.timestamp)
+
+        # 3. Generate deterministic column names & detect collisions
+        feature_names: list[str] = []
+        seen_names: set[str] = set()
+        for defn in features:
+            col_name = generate_feature_name(defn)
+            if col_name in seen_names:
+                raise ValueError(
+                    f"Duplicate feature configuration or column name collision detected: '{col_name}'"
+                )
+            seen_names.add(col_name)
+            feature_names.append(col_name)
+
+        # 4. Validate observation_dates if provided
+        req_dates: list[date] | None = None
+        if observation_dates is not None:
+            if not isinstance(observation_dates, Sequence) or isinstance(
+                observation_dates, (str, bytes)
+            ):
+                raise TypeError("observation_dates must be a sequence of date")
+            req_dates = []
+            for i, d in enumerate(observation_dates):
+                if isinstance(d, datetime):
+                    raise TypeError(f"observation_dates[{i}] must be a date, not a datetime")
+                if not isinstance(d, date):
+                    raise TypeError(
+                        f"observation_dates[{i}] must be a date instance, got {type(d).__name__}"
+                    )
+                req_dates.append(d)
+            if len(req_dates) != len(set(req_dates)):
+                raise ValueError("Duplicate observation dates requested")
+
+        # 5. Check for duplicate observation dates for this instrument in market bars
+        bar_dates = [b.timestamp.date() for b in sorted_bars]
+        if len(bar_dates) != len(set(bar_dates)):
+            raise ValueError(
+                f"Duplicate market observation dates found for instrument {instrument_id}. "
+                f"Deduplicate the input bars before constructing a dataset."
+            )
+
+        # 6. Determine candidate observation dates
+        if req_dates is None:
+            candidate_dates = bar_dates
+        else:
+            bar_date_set = set(bar_dates)
+            sorted_req_dates = sorted(req_dates)
+            candidate_dates = [d for d in sorted_req_dates if d in bar_date_set]
+
+        # 7. Map calendar dates to chronological bar indices
+        date_to_idx = {b.timestamp.date(): i for i, b in enumerate(sorted_bars)}
+
+        # 8. Point-in-time calculation loop
+        rows: list[InferenceRow] = []
+        dropped_incomplete_feature_count = 0
+
+        for obs_date in candidate_dates:
+            obs_idx = date_to_idx[obs_date]
+            # STRICT POINT-IN-TIME SLICE: only bars up to and including obs_idx
+            history_bars = sorted_bars[: obs_idx + 1]
+
+            ctx = FeatureCalculationContext(
+                instrument_id=instrument_id,
+                as_of_date=obs_date,
+                market_bars=history_bars,
+            )
+
+            row_features: list[Decimal] = []
+            has_missing_feature = False
+
+            for defn in features:
+                f_val = self._feature_engine.calculate(defn, ctx)
+                if f_val is None or not f_val.value.is_finite():
+                    has_missing_feature = True
+                    break
+                row_features.append(f_val.value)
+
+            if has_missing_feature:
+                dropped_incomplete_feature_count += 1
+                continue
+
+            row = InferenceRow(
+                instrument_id=instrument_id,
+                observation_date=obs_date,
+                feature_values=tuple(row_features),
+            )
+            rows.append(row)
+
+        return InferenceMatrix(
+            instrument_id=instrument_id,
+            feature_names=tuple(feature_names),
+            feature_definitions=tuple(features),
+            rows=tuple(rows),
+            dropped_incomplete_feature_count=dropped_incomplete_feature_count,
         )
